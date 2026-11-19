@@ -59,10 +59,41 @@ Ogni strumento è descritto una sola volta tramite `ToolSpec(name, description, 
 
 ### 4. Scheduler event-driven in `asyncio` (e perché il DAG non è un `StateGraph` dinamico)
 L'`Executor` è completamente indipendente da LangGraph ed esegue il `CompiledDAG` con uno scheduler **event-driven / ready-queue** (`asyncio.create_task` + `asyncio.wait(..., return_when=FIRST_COMPLETED)` + `dag.is_ready()`):
-* **Nessuna barriera wave-based / BSP**: il runtime Pregel di LangGraph avanza per superstep sincroni (modello *Bulk Synchronous Parallel*), costringendo tutti i nodi del superstep corrente a terminare prima di avviare il successivo. Su un DAG asimmetrico (es. ramo A `0.1s -> 2.5s`, ramo B `3.0s -> 0.1s`, join `0.1s`), uno scheduler BSP impiega `5.6s`, mentre il nostro scheduler event-driven completa in `3.2s` perché avvia i figli del ramo veloce non appena il predecessore termina.
+* **Nessuna barriera wave-based / BSP**: il runtime Pregel di LangGraph avanza per superstep sincroni (modello *Bulk Synchronous Parallel*), costringendo tutti i nodi del superstep corrente a terminare prima di avviare il successivo.
 * **Concorrenza controllata (`max_concurrency`)**: default `8`, `None` per concorrenza illimitata, `1` come **baseline sequenziale deterministico** sullo stesso `Executor` (a parità di overhead).
 * **Tool sync e async**: `async def` invocati con `await`, `def` sincroni eseguiti via `asyncio.to_thread()` per non bloccare l'event loop.
 * **Timeout configurabili (`task_timeout_s`)**: su tool `async def` annullano la coroutine via `asyncio.wait_for`; su tool sincroni in `asyncio.to_thread` interrompono l'attesa registrando un errore di timeout (in Python un thread OS già avviato non può essere terminato forzatamente, quindi è bene evitare tool sincroni con side-effect non idempotenti nei test di timeout).
+
+#### Verifica sperimentale: Event-driven vs LangGraph `StateGraph` dinamico (Pregel BSP)
+Per verificare quantitativamente questa scelta senza varianza LLM, `experiments/benchmark_scheduling.py` (risultati salvati in `results/benchmark_scheduling.json`) esegue **gli stessi identici `CompiledDAG`** con tre motori (mediana su 3 ripetizioni):
+
+| Topologia DAG | Nodi / Livelli | Sequenziale (`max=1`) | LangGraph Pregel BSP *(+compile)* | Executor Event-driven (`max=8`) | Speedup BSP | Speedup Event-driven | Riduzione latenza vs BSP |
+| :--- | :---: | ---: | ---: | ---: | :---: | :---: | :---: |
+| `symmetric_fanout` *(controllo equità)* | 5 / 2 | 522.2 ms | 164.4 ms *(+2.8 ms)* | **160.9 ms** | 3.18x | **3.25x** | -2.1% *(parità)* |
+| `asymmetric_branches` *(T1:50→T3:250 vs T2:300→T4:50 → T5:50)* | 5 / 3 | 702.5 ms | 606.1 ms *(+3.0 ms)* | **401.8 ms** | 1.16x | **1.75x** | **-33.7%** (-204 ms) |
+| `staggered_multi_branch` *(profilo reale di `test2`)* | 8 / 3 | 903.7 ms | 466.4 ms *(+4.0 ms)* | **421.8 ms** | 1.94x | **2.14x** | **-9.6%** (-45 ms) |
+| `deep_asymmetric_pipeline` *(4 livelli asimmetrici)* | 7 / 4 | 663.3 ms | 548.3 ms *(+3.8 ms)* | **383.0 ms** | 1.21x | **1.73x** | **-30.1%** (-165 ms) |
+
+Il confronto diretto delle timeline su `asymmetric_branches` (stessa scala temporale `0 → 606 ms`) rende visibile la **barriera di superstep BSP**: in LangGraph Pregel `T3` resta fermo per ~252 ms dopo il completamento di `T1` in attesa della fine di `T2`, mentre nell'`Executor` event-driven `T3` parte immediatamente a `51 ms` e gira in parallelo a `T2`:
+
+```text
+LangGraph Pregel BSP (606 ms):
+  T1 │██································│   1 →  52 ms
+  T2 │████████████████··················│   1 → 302 ms
+  T3 │·················██████████████···│ 304 → 555 ms  <-- fermo 252 ms alla barriera BSP
+  T4 │·················██···············│ 304 → 354 ms
+  T5 │·······························██·│ 555 → 606 ms
+
+Executor Event-driven (402 ms):
+  T1 │██································│   0 →  50 ms
+  T2 │████████████████··················│   0 → 301 ms
+  T3 │··██████████████··················│  51 → 301 ms  <-- parte subito al termine di T1
+  T4 │················███···············│ 301 → 352 ms
+  T5 │···················███············│ 352 → 402 ms
+```
+
+* Su DAG simmetrici (`symmetric_fanout`) i due motori si equivalgono (confermando l'equità del benchmark e un overhead Pregel contenuto di ~3.5 ms + ~2.8 ms di compilazione dinamica).
+* Su DAG asimmetrici — tipici delle chiamate a strumenti/API con latenze diverse — lo scheduler event-driven abbatte la latenza di esecuzione fino al **-33.7%** rispetto a un `StateGraph` dinamico LangGraph.
 
 ### 5. Gestione errori best-effort, propagazione `SKIPPED` e telemetria
 In caso di errore di un task, l'`Executor` **non interrompe** i rami indipendenti:
@@ -122,8 +153,10 @@ langgraph-llm-compiler/
 ├── experiments/
 │   ├── test_planner_qwen3.py      # Pipeline diretta Python (Registry -> Planner -> Compiler -> Executor -> Joiner)
 │   ├── test_graph_qwen3.py        # Esperimento A (live LangGraph vs Direct) + Esperimento B (overhead isolato)
-│   └── test2.py                   # Stress test multi-scenario (DAG asimmetrici, fan-out, fallimento parziale)
-└── results/                       # Output sperimentali e benchmark
+│   ├── test2.py                   # Trace visivo fase-per-fase su LangGraph + export PNG/Mermaid in results/
+│   ├── benchmark_v1_baseline.py   # Suite baseline v1 (8 query, reasoning=False vs True -> results/*.json)
+│   └── benchmark_scheduling.py    # Benchmark deterministico Event-driven vs LangGraph Pregel BSP vs Seq
+└── results/                       # Output sperimentali, benchmark JSON e diagrammi PNG/Mermaid
 ```
 
 ---
@@ -133,7 +166,7 @@ langgraph-llm-compiler/
 Requisiti: Python `>=3.12`, [`uv`](https://docs.astral.sh/uv/) e [Ollama](https://ollama.com/) (solo per gli esperimenti live con modelli locali).
 
 ```bash
-# Installa le dipendenze (inclusi pytest e ruff)
+# Installa le dipendenze (inclusi pytest, ruff e grandalf per draw_ascii)
 uv sync
 
 # Esegui la suite di test unitari (non richiede Ollama)
@@ -143,15 +176,21 @@ uv run pytest -v
 uv run ruff check src tests experiments
 ```
 
-### Esperimento end-to-end con `qwen3:8b`
-
-Assicurati che Ollama sia attivo con il modello `qwen3:8b` disponibile (`ollama pull qwen3:8b`), poi esegui:
+### Esperimenti e benchmark
 
 ```bash
-uv run python experiments/test_planner_qwen3.py
-```
+# Benchmark deterministico di scheduling (Event-driven vs LangGraph Pregel BSP, non richiede Ollama)
+uv run python experiments/benchmark_scheduling.py --repeats 3
 
-Lo script esegue l'intera pipeline (`ToolRegistry -> Planner -> PlanCompiler -> Executor -> Joiner`), confronta il run parallelo (`max_concurrency=8`) con il baseline sequenziale (`max_concurrency=1`) sullo stesso `CompiledDAG` e stampa timeline ASCII, risposta finale e riepilogo metriche.
+# Benchmark isolato dell'overhead di orchestrazione LangGraph (non richiede Ollama)
+uv run python experiments/test_graph_qwen3.py --mode overhead --overhead-iters 50
+
+# Trace visivo fase-per-fase con qwen3:8b + export PNG e report Mermaid in results/
+uv run python experiments/test2.py --no-reasoning
+
+# Suite baseline v1 (8 query, reasoning=False vs True, richiede Ollama + qwen3:8b)
+uv run python experiments/benchmark_v1_baseline.py --reasoning-modes both
+```
 
 ---
 

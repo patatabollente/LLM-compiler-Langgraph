@@ -1,30 +1,71 @@
 import argparse
 import asyncio
+import sys
+import textwrap
 import time
 from dataclasses import dataclass
-from typing import Literal
+from pathlib import Path
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from langgraph_llm_compiler.compiler import (
     CompiledDAG,
-    PlanCompilationError,
     PlanCompiler,
     ToolRegistry,
     ToolSpec,
 )
 from langgraph_llm_compiler.executor import ExecutionResult, Executor
-from langgraph_llm_compiler.joiner import Joiner, JoinerOutputError, JoinerResult
+from langgraph_llm_compiler.graph import CompilerState, build_compiler_graph
+from langgraph_llm_compiler.joiner import Joiner, JoinerResult
 from langgraph_llm_compiler.llm import create_ollama_chat_model
-from langgraph_llm_compiler.planner import ExecutionPlan, Planner, PlannerOutputError
+from langgraph_llm_compiler.planner import ExecutionPlan, Planner
 
 # =============================================================================
 # Experiment configuration
 # =============================================================================
 
 MODEL_NAME = "qwen3:8b"
+RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 SIMULATED_EXCHANGE_DELAY_S = 0.12
 SIMULATED_SYNC_TOOL_DELAY_S = 0.04
+
+
+# =============================================================================
+# Minimal ANSI styling helper (cleanly disabled with --no-color or non-TTY)
+# =============================================================================
+
+
+class Style:
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def _wrap(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.enabled else text
+
+    def bold(self, text: str) -> str:
+        return self._wrap("1", text)
+
+    def dim(self, text: str) -> str:
+        return self._wrap("2", text)
+
+    def cyan(self, text: str) -> str:
+        return self._wrap("1;36", text)
+
+    def blue(self, text: str) -> str:
+        return self._wrap("1;34", text)
+
+    def green(self, text: str) -> str:
+        return self._wrap("1;32", text)
+
+    def yellow(self, text: str) -> str:
+        return self._wrap("1;33", text)
+
+    def red(self, text: str) -> str:
+        return self._wrap("1;31", text)
+
+    def magenta(self, text: str) -> str:
+        return self._wrap("1;35", text)
 
 
 # =============================================================================
@@ -244,11 +285,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario(
         name="multi_branch_diamond",
         title="Asymmetric multi-branch DAG + nested outputs",
-        focus=(
-            "4 parallel roots with asymmetric latencies (France 380ms vs Italy 100ms), "
-            "nested output_path ['economy', 'gdp_billion_usd'], "
-            "event-driven execution without wave barriers."
-        ),
+        focus="4 parallel roots (France 380ms vs Italy 100ms) + nested economy.gdp_billion_usd",
         request=(
             "Fetch statistics for Italy, France, and Germany, and get the USD to EUR "
             "exchange rate. Then: "
@@ -260,10 +297,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario(
         name="wide_fanout_tree",
         title="Wide fan-out (4 countries) + 4-level reduction tree",
-        focus=(
-            "4 parallel lookups, 2 parallel sums, total sum, and final average "
-            "using nested output_path on economy.gdp_billion_usd."
-        ),
+        focus="4 parallel lookups -> 2 parallel sums -> total -> average (/ 4)",
         request=(
             "Fetch statistics for Italy, France, Germany, and Spain. "
             "Compute the sum of GDP (gdp_billion_usd) of Italy and France, "
@@ -275,11 +309,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario(
         name="partial_failure_recovery",
         title="Partial failure + transitive skip + transparent Joiner",
-        focus=(
-            "country_stats('Atlantis') fails, the dependent subtraction is skipped, "
-            "Italy's independent density branch succeeds, and the Joiner returns status='partial' "
-            "without hallucinating missing data."
-        ),
+        focus="Atlantis fails -> subtraction skipped -> Italy density completes -> status='partial'",
         request=(
             "Fetch statistics for Italy and Atlantis. "
             "Compute Italy's population density (population divided by area_km2) "
@@ -293,6 +323,7 @@ SCENARIOS: tuple[Scenario, ...] = (
 @dataclass(frozen=True)
 class ScenarioSummary:
     name: str
+    path: str
     plan_valid: bool
     nodes: int
     levels: int
@@ -301,6 +332,8 @@ class ScenarioSummary:
     exec_par_ms: float
     exec_seq_ms: float
     joining_ms: float
+    graph_wall_ms: float
+    overhead_ms: float
     effective_parallelism: float
     speedup: float
     success_rate: float
@@ -309,329 +342,572 @@ class ScenarioSummary:
 
 
 # =============================================================================
-# Printing helpers grouped by component responsibility
+# Clean, human-readable, zero-wrap display helpers (<= 88 columns)
 # =============================================================================
 
-
-def print_banner(title: str) -> None:
-    line = "#" * 78
-    print(f"\n{line}")
-    print(f"# {title}")
-    print(line)
+MAX_COL = 84
 
 
-def print_header(step: str, owner: str, subtitle: str) -> None:
-    line = "=" * 78
-    print(f"\n{line}")
-    print(f"[{step}] {owner} — {subtitle}")
-    print(line)
+def _format_output_human(tool_name: str, output: Any) -> str:
+    """Render tool outputs concisely so terminal rows never wrap awkwardly."""
+    if not isinstance(output, dict):
+        return str(output)
 
-
-def print_registry_section(registry: ToolRegistry, catalog: dict[str, str]) -> None:
-    print_header("1/6", "TOOL REGISTRY", "I/O contracts and generated catalog")
-    print(f"Registered tools: {len(registry)} ({', '.join(registry.names())})")
-    for name, desc in catalog.items():
-        print(f"  - {name}: {desc}")
-
-
-def print_planner_section(
-    scenario: Scenario,
-    model: str,
-    plan: ExecutionPlan,
-    planning_ms: float,
-) -> None:
-    print_header("2/6", "PLANNER", f"ExecutionPlan generation ({model})")
-    print(f"Scenario:         {scenario.name} — {scenario.title}")
-    print(f"Focus:            {scenario.focus}")
-    print(f"User request:     {scenario.request}")
-    print(f"Planning latency: {planning_ms:.2f} ms ({planning_ms / 1000:.2f} s)")
-    print(f"Generated tasks:  {len(plan.tasks)}")
-    print("\nCompact plan:")
-    for task in plan.tasks:
-        bindings = {
-            k: f"{b.task_id}.{'.'.join(b.output_path)}" if b.output_path else b.task_id
-            for k, b in task.bindings.items()
-        }
-        print(
-            f"  - {task.task_id:<8} | {task.tool_name:<16} | "
-            f"static={task.static_inputs} | bindings={bindings}"
+    if tool_name == "country_stats" and "population" in output:
+        econ = output.get("economy") or {}
+        gdp = econ.get("gdp_billion_usd")
+        unemp = econ.get("unemployment_pct")
+        return (
+            f"{output['country']}: pop={output['population']:,} | "
+            f"area={output['area_km2']:,.0f} km² | GDP=${gdp:,.0f}B | unemp={unemp}%"
         )
+    if tool_name == "exchange_rate" and "rate" in output:
+        return f"{output['pair']} = {output['rate']}"
+    if tool_name == "calculator" and "result" in output:
+        return f"result = {output['result']:,.2f}"
+    if tool_name == "percentage_diff" and "percent_change" in output:
+        return f"delta = {output['delta']:+,.2f} ({output['percent_change']:+.2f}%)"
+    return str(output)
 
 
-def print_compiler_section(dag: CompiledDAG, compile_ms: float) -> None:
-    print_header("3/6", "PLAN COMPILER", "Semantic validation and CompiledDAG")
-    edge_count = sum(len(deps) for deps in dag.dependencies.values())
-    max_width = max((len(level) for level in dag.levels), default=0)
-
-    print("Compilation status:    VALID")
-    print(f"Compilation latency:   {compile_ms:.2f} ms")
-    print(f"DAG nodes / edges:     {len(dag.tasks)} nodes, {edge_count} edges")
-    print(f"Depth (levels):        {len(dag.levels)}")
-    print(f"Max theoretical width: {max_width} parallel tasks")
-    print(f"Topological order:     {list(dag.topological_order)}")
-    print(f"Parallel levels:       {[list(level) for level in dag.levels]}")
-    print(f"Root tasks:            {list(dag.root_tasks)}")
-    print(f"Leaf tasks:            {list(dag.leaf_tasks)}")
+def _format_task_call(task: Any) -> str:
+    """Format a TaskSpec as a clean call expression: foo(a='x', b <- task_1.val)."""
+    parts: list[str] = []
+    for k, v in task.static_inputs.items():
+        parts.append(f"{k}={v!r}")
+    for k, b in task.bindings.items():
+        ref = f"{b.task_id}.{'.'.join(b.output_path)}" if b.output_path else b.task_id
+        parts.append(f"{k} ← {ref}")
+    return f"{task.tool_name}({', '.join(parts)})"
 
 
 def _render_timeline_bar(
     started_at_ms: float | None,
     finished_at_ms: float | None,
     total_ms: float,
-    width: int = 32,
+    width: int = 24,
 ) -> str:
     if started_at_ms is None or finished_at_ms is None or total_ms <= 0:
-        return "." * width
+        return "·" * width
     start_idx = min(width - 1, max(0, int((started_at_ms / total_ms) * width)))
     end_idx = min(width, max(start_idx + 1, int((finished_at_ms / total_ms) * width)))
-    return "." * start_idx + "#" * (end_idx - start_idx) + "." * (width - end_idx)
+    return "·" * start_idx + "█" * (end_idx - start_idx) + "·" * (width - end_idx)
 
 
-def print_executor_section(
-    parallel_res: ExecutionResult,
-    sequential_res: ExecutionResult,
+def _print_phase_bar(style: Style, step: str, title: str, right_tag: str = "") -> None:
+    label = f" {step} · {title} "
+    tag = f" {right_tag} " if right_tag else ""
+    fill = max(2, MAX_COL - len(label) - len(tag))
+    print(f"\n{style.cyan(label)}{style.dim('─' * fill)}{style.dim(tag)}")
+
+
+def print_setup(
+    style: Style,
+    registry: ToolRegistry,
+    graph: Any,
+    planner_reasoning: bool,
 ) -> None:
-    print_header(
-        "4/6",
-        "EXECUTOR",
-        "Event-driven parallel execution vs sequential baseline",
+    print(f"\n{style.bold('═' * MAX_COL)}")
+    print(style.bold("  LANGGRAPH LLM COMPILER — STEP-BY-STEP VISUAL TRACE"))
+    print(style.bold("═" * MAX_COL))
+    print(
+        f"  Model    : {style.bold(MODEL_NAME)} "
+        f"(planner reasoning={planner_reasoning}, joiner reasoning=False)"
     )
-    total_tasks = len(parallel_res.results)
-    succeeded = len(parallel_res.succeeded_task_ids)
-    failed = len(parallel_res.failed_task_ids)
-    skipped = len(parallel_res.skipped_task_ids)
-    success_rate = (succeeded / total_tasks * 100.0) if total_tasks else 0.0
+    print(f"  Tools    : {', '.join(registry.names())}")
+    try:
+        ascii_tree = graph.get_graph().draw_ascii()
+        print(style.dim("\n  LangGraph StateGraph (draw_ascii):"))
+        for line in ascii_tree.splitlines():
+            print(f"    {line}")
+    except Exception:  # noqa: BLE001
+        print(
+            "  Workflow : "
+            + style.magenta("START")
+            + " → "
+            + style.cyan("planner")
+            + " → "
+            + style.cyan("compiler")
+            + " → "
+            + style.cyan("executor")
+            + " → "
+            + style.cyan("joiner")
+            + " → "
+            + style.magenta("END")
+            + style.dim("  (error → END)")
+        )
 
+
+def print_question(style: Style, scenario: Scenario) -> None:
+    print(f"\n{style.blue('━' * MAX_COL)}")
+    print(f"  {style.bold('SCENARIO:')} {style.blue(scenario.name)} — {scenario.title}")
+    print(f"  {style.dim('Focus: ' + scenario.focus)}")
+    print(style.blue("━" * MAX_COL))
+
+    _print_phase_bar(style, "0", "USER REQUEST", "START → planner")
+    for line in textwrap.wrap(scenario.request, width=MAX_COL - 4):
+        print(f"  {line}")
+
+
+def print_planner_phase(
+    style: Style,
+    update: dict[str, Any],
+    *,
+    show_json: bool,
+) -> None:
+    metrics = update["metrics"]
+    err = update.get("error")
+    plan: ExecutionPlan | None = update.get("plan")
+    ms = metrics.planning_latency_ms or 0.0
+
+    _print_phase_bar(style, "1", "PLANNER (LangGraph node)", f"{ms / 1000:.2f}s · LLM #{metrics.llm_calls}")
+
+    if err is not None or plan is None:
+        print(f"  {style.red('FAILED')}: {err.error_type if err else 'Unknown'} — {err.message if err else ''}")
+        return
+
+    print(f"  {style.green('OK')} · Generated {style.bold(str(len(plan.tasks)))} tasks:")
+    for task in plan.tasks:
+        call_str = _format_task_call(task)
+        wrapped = textwrap.wrap(call_str, width=MAX_COL - 13)
+        print(f"    {style.bold(f'{task.task_id:<6}')}  {wrapped[0]}")
+        for cont in wrapped[1:]:
+            print(f"            {cont}")
+
+    if show_json:
+        print(style.dim("\n  Raw ExecutionPlan JSON:"))
+        for line in plan.model_dump_json(indent=2).splitlines():
+            print(style.dim(f"    {line}"))
+
+
+def print_compiler_phase(style: Style, update: dict[str, Any]) -> None:
+    metrics = update["metrics"]
+    err = update.get("error")
+    dag: CompiledDAG | None = update.get("compiled_dag")
+    ms = metrics.compilation_latency_ms or 0.0
+
+    _print_phase_bar(style, "2", "COMPILER (LangGraph node)", f"{ms:.2f}ms")
+
+    if err is not None or dag is None:
+        print(f"  {style.red('INVALID PLAN')} ({err.error_type if err else 'Unknown'}):")
+        if err is not None and err.issues:
+            for issue in err.issues:
+                print(f"    {style.red('✗')} {issue}")
+        elif err is not None:
+            print(f"    {err.message}")
+        return
+
+    edge_count = sum(len(deps) for deps in dag.dependencies.values())
+    max_width = max((len(level) for level in dag.levels), default=0)
     print(
-        f"Parallel run   (max_concurrency={parallel_res.max_concurrency}): "
-        f"{parallel_res.total_duration_ms:.2f} ms"
-    )
-    print(
-        f"Sequential run (max_concurrency={sequential_res.max_concurrency}): "
-        f"{sequential_res.total_duration_ms:.2f} ms"
-    )
-    print(
-        f"Task outcomes: {succeeded} success / {failed} error / {skipped} skipped "
-        f"(success rate: {success_rate:.1f}%)"
+        f"  {style.green('VALID DAG')} · {len(dag.tasks)} nodes, {edge_count} edges, "
+        f"{len(dag.levels)} levels (max parallel width: {max_width})"
     )
 
-    print("\nParallel execution timeline:")
-    for task_id, res in parallel_res.results.items():
+    print(style.dim("\n  Parallelism layers:"))
+    for idx, level in enumerate(dag.levels):
+        boxes = "  ".join(f"[{tid}:{dag.get_task(tid).tool_name}]" for tid in level)
+        print(f"    L{idx} │ {boxes}")
+
+    # Group dependencies cleanly by downstream consumer
+    consumers = [tid for tid in dag.topological_order if dag.get_task(tid).bindings]
+    if consumers:
+        print(style.dim("\n  Dataflow (who reads from whom):"))
+        for tid in consumers:
+            bindings = dag.get_task(tid).bindings
+            sources = ", ".join(
+                f"{b.task_id}.{'.'.join(b.output_path) if b.output_path else '*'}→{p}"
+                for p, b in bindings.items()
+            )
+            print(f"    {style.bold(f'{tid:<6}')} ◄── {sources}")
+
+
+def print_executor_phase(
+    style: Style,
+    update: dict[str, Any],
+    sequential_res: ExecutionResult | None,
+) -> None:
+    metrics = update["metrics"]
+    err = update.get("error")
+    exec_res: ExecutionResult | None = update.get("execution_result")
+    ms = metrics.execution_latency_ms or 0.0
+
+    speedup_tag = ""
+    if exec_res is not None and sequential_res is not None and exec_res.total_duration_ms > 0:
+        sp = sequential_res.total_duration_ms / exec_res.total_duration_ms
+        speedup_tag = f" · speedup {sp:.2f}x"
+
+    _print_phase_bar(style, "3", "EXECUTOR (Event-driven async)", f"{ms:.1f}ms{speedup_tag}")
+
+    if err is not None or exec_res is None:
+        print(f"  {style.red('EXECUTOR ERROR')}: {err.message if err else 'Unknown'}")
+        return
+
+    ok = len(exec_res.succeeded_task_ids)
+    fail = len(exec_res.failed_task_ids)
+    skip = len(exec_res.skipped_task_ids)
+
+    summary_line = (
+        f"  Tasks: {style.green(f'{ok} ok')} / "
+        f"{style.red(f'{fail} err') if fail else '0 err'} / "
+        f"{style.yellow(f'{skip} skip') if skip else '0 skip'}"
+    )
+    if sequential_res is not None and exec_res.total_duration_ms > 0:
+        sp = sequential_res.total_duration_ms / exec_res.total_duration_ms
+        summary_line += (
+            f"   │   Parallel: {style.bold(f'{exec_res.total_duration_ms:.1f}ms')} "
+            f"vs Seq: {sequential_res.total_duration_ms:.1f}ms "
+            f"({style.green(f'{sp:.2f}x')})"
+        )
+    print(summary_line)
+
+    print(style.dim("\n  Timeline (0ms ──────────────► end):"))
+    for tid, res in exec_res.results.items():
         bar = _render_timeline_bar(
             res.started_at_ms,
             res.finished_at_ms,
-            parallel_res.total_duration_ms,
+            exec_res.total_duration_ms,
         )
         if res.status == "success":
-            window = f"{res.started_at_ms:6.1f} -> {res.finished_at_ms:6.1f} ms"
-            detail = f"output={res.output}"
+            badge = style.green("OK  ")
+            timing = f"{res.started_at_ms:5.0f}→{res.finished_at_ms:5.0f}ms ({res.duration_ms:4.0f}ms)"
+            detail = _format_output_human(res.tool_name, res.output)
         elif res.status == "error":
-            window = f"{res.started_at_ms or 0.0:6.1f} -> {res.finished_at_ms or 0.0:6.1f} ms"
-            detail = f"error[{res.error_stage}/{res.error_type}]={res.error}"
+            badge = style.red("ERR ")
+            timing = f"{res.started_at_ms or 0:5.0f}→{res.finished_at_ms or 0:5.0f}ms ({res.duration_ms:4.0f}ms)"
+            detail = style.red(f"{res.error_type}: {res.error}")
         else:
-            window = "   skipped         "
-            detail = f"reason={res.skip_reason}"
+            badge = style.yellow("SKIP")
+            timing = "     skipped      "
+            detail = style.yellow(res.skip_reason or "upstream failed")
 
-        print(
-            f"  {task_id:<8} | {res.tool_name:<15} | {res.status:<7} | "
-            f"[{bar}] | {window} | {res.duration_ms:6.1f} ms | {detail}"
-        )
+        print(f"    {style.bold(f'{tid:<6}')} {res.tool_name:<15} {badge} │{bar}│ {timing}")
+        print(f"           {style.dim('└─')} {detail}")
 
 
-def print_joiner_section(
-    model: str,
-    joiner_res: JoinerResult,
-    joining_ms: float,
-) -> None:
-    print_header("5/6", "JOINER", f"Final answer synthesis ({model})")
-    print(f"Deterministic status: {joiner_res.status}")
-    print(f"Joining latency:      {joining_ms:.2f} ms ({joining_ms / 1000:.2f} s)")
+def print_joiner_phase(style: Style, update: dict[str, Any]) -> None:
+    metrics = update["metrics"]
+    err = update.get("error")
+    joiner_res: JoinerResult | None = update.get("joiner_result")
+    ms = metrics.joining_latency_ms or 0.0
+
+    _print_phase_bar(style, "4", "JOINER (LangGraph node)", f"{ms / 1000:.2f}s · LLM #{metrics.llm_calls}")
+
+    if err is not None or joiner_res is None:
+        print(f"  {style.red('FAILED')}: {err.message if err else 'Unknown'}")
+        return
+
+    status_badge = (
+        style.green("COMPLETE")
+        if joiner_res.status == "complete"
+        else style.yellow("PARTIAL")
+        if joiner_res.status == "partial"
+        else style.red("FAILED")
+    )
+    print(f"  Status : {status_badge}")
+
     if joiner_res.missing_information:
-        print("Missing information:")
+        print(f"  {style.yellow('Missing')}:")
         for item in joiner_res.missing_information:
-            print(f"  - {item}")
-    else:
-        print("Missing information: none")
-    print("\nFinal answer:")
-    print(f"  {joiner_res.answer}")
+            for idx, line in enumerate(textwrap.wrap(item, width=MAX_COL - 8)):
+                prefix = "    • " if idx == 0 else "      "
+                print(f"{prefix}{line}")
+
+    print(f"\n  {style.bold('Answer:')}")
+    for para in joiner_res.answer.splitlines():
+        if not para.strip():
+            print()
+            continue
+        for line in textwrap.wrap(para, width=MAX_COL - 6):
+            print(f"    {line}")
 
 
-def print_metrics_summary(summary: ScenarioSummary) -> None:
-    print_header("6/6", "METRICS", f"Summary for scenario '{summary.name}'")
-    e2e_ms = (
-        summary.planning_ms
-        + summary.compile_ms
-        + summary.exec_par_ms
-        + summary.joining_ms
+def print_scenario_footer(style: Style, summary: ScenarioSummary) -> None:
+    _print_phase_bar(style, "✓", "LANGGRAPH SUMMARY", summary.name)
+    print(f"  Path     : {style.magenta(summary.path)}")
+    print(
+        f"  Timings  : Plan {summary.planning_ms / 1000:.2f}s │ "
+        f"Compile {summary.compile_ms:.2f}ms │ "
+        f"Exec {summary.exec_par_ms:.1f}ms │ "
+        f"Join {summary.joining_ms / 1000:.2f}s"
     )
-    rows = [
-        ("Planning latency", f"{summary.planning_ms:.2f} ms ({summary.planning_ms / 1000:.2f} s)"),
-        ("Compilation latency", f"{summary.compile_ms:.2f} ms"),
-        ("Execution latency (parallel)", f"{summary.exec_par_ms:.2f} ms"),
-        ("Execution latency (sequential)", f"{summary.exec_seq_ms:.2f} ms"),
-        ("Joining latency", f"{summary.joining_ms:.2f} ms ({summary.joining_ms / 1000:.2f} s)"),
-        ("Effective parallelism", f"{summary.effective_parallelism:.2f}x"),
-        ("Measured speedup (T_seq / T_par)", f"{summary.speedup:.2f}x"),
-        ("Task success rate", f"{summary.success_rate:.1f}%"),
-        ("Joiner status", summary.joiner_status),
-        ("Plan validity", "VALID" if summary.plan_valid else "INVALID"),
-        ("LLM calls", str(summary.llm_calls)),
-        ("End-to-end latency", f"{e2e_ms:.2f} ms ({e2e_ms / 1000:.2f} s)"),
-    ]
-    label_width = max(len(label) for label, _ in rows)
-    for label, value in rows:
-        print(f"  {label:<{label_width}} : {value}")
+    print(
+        f"  Totals   : Wall {style.bold(f'{summary.graph_wall_ms / 1000:.2f}s')} │ "
+        f"LangGraph overhead {summary.overhead_ms:.2f}ms │ "
+        f"Speedup {style.green(f'{summary.speedup:.2f}x')} │ "
+        f"LLM calls: {summary.llm_calls}"
+    )
 
 
-def print_comparative_table(summaries: list[ScenarioSummary]) -> None:
-    print_banner("CROSS-SCENARIO COMPARISON")
+def print_comparative_table(style: Style, summaries: list[ScenarioSummary]) -> None:
+    print(f"\n{style.bold('═' * MAX_COL)}")
+    print(style.bold("  CROSS-SCENARIO SUMMARY"))
+    print(style.bold("═" * MAX_COL))
     header = (
-        f"{'Scenario':<25} | {'Valid':<5} | {'Nodes/Lvl':<9} | "
-        f"{'Plan(s)':>7} | {'Par(ms)':>7} | {'Seq(ms)':>7} | "
-        f"{'Speedup':>7} | {'Join(s)':>7} | {'Status':<8} | {'LLM':>3}"
+        f"  {'Scenario':<24} {'Valid':<5} {'DAG':<5} "
+        f"{'Plan':>6} {'Exec':>6} {'Spd':>6} {'Join':>6} {'Ovh':>6} {'Status':<8}"
     )
-    print(header)
-    print("-" * len(header))
+    print(style.bold(header))
+    print(style.dim("  " + "─" * (MAX_COL - 2)))
     for s in summaries:
+        valid = style.green("OK   ") if s.plan_valid else style.red("FAIL ")
+        status_color = (
+            style.green(f"{s.joiner_status:<8}")
+            if s.joiner_status == "complete"
+            else style.yellow(f"{s.joiner_status:<8}")
+            if s.joiner_status == "partial"
+            else style.red(f"{s.joiner_status:<8}")
+        )
         print(
-            f"{s.name:<25} | {('OK' if s.plan_valid else 'FAIL'):<5} | "
-            f"{f'{s.nodes}/{s.levels}':<9} | "
-            f"{s.planning_ms / 1000:7.2f} | {s.exec_par_ms:7.1f} | "
-            f"{s.exec_seq_ms:7.1f} | {s.speedup:6.2f}x | "
-            f"{s.joining_ms / 1000:7.2f} | {s.joiner_status:<8} | {s.llm_calls:>3}"
+            f"  {s.name:<24} {valid} {f'{s.nodes}n/{s.levels}l':<5} "
+            f"{s.planning_ms / 1000:5.2f}s {s.exec_par_ms:4.0f}ms "
+            f"{s.speedup:5.2f}x {s.joining_ms / 1000:5.2f}s "
+            f"{s.overhead_ms:4.1f}ms {status_color}"
         )
 
 
 # =============================================================================
-# Single scenario runner
+# Visual artifact export (LangGraph PNG + Markdown report with Mermaid DAGs)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class ScenarioArtifact:
+    scenario: Scenario
+    summary: ScenarioSummary
+    state: CompilerState
+
+
+def render_dag_mermaid(
+    dag: CompiledDAG,
+    execution_result: ExecutionResult | None = None,
+) -> str:
+    """Render a CompiledDAG as a Mermaid flowchart colored by execution outcome."""
+    lines = [
+        "flowchart TD",
+        "    classDef ok fill:#dcfce7,stroke:#16a34a,color:#14532d",
+        "    classDef err fill:#fee2e2,stroke:#dc2626,color:#7f1d1d",
+        "    classDef skip fill:#fef3c7,stroke:#d97706,color:#78350f",
+    ]
+
+    for tid in dag.topological_order:
+        task = dag.get_task(tid)
+        status_cls = ""
+        meta = ""
+        if execution_result is not None and tid in execution_result.results:
+            res = execution_result.results[tid]
+            if res.status == "success":
+                status_cls = ":::ok"
+                meta = f" | OK {res.duration_ms:.0f}ms"
+            elif res.status == "error":
+                status_cls = ":::err"
+                meta = f" | ERR {res.error_type or ''}".rstrip()
+            else:
+                status_cls = ":::skip"
+                meta = " | SKIPPED"
+
+        label = f"{tid}: {task.tool_name}{meta}".replace('"', "'")
+        lines.append(f'    {tid}["{label}"]{status_cls}')
+
+    for tid in dag.topological_order:
+        task = dag.get_task(tid)
+        for param, binding in task.bindings.items():
+            path = ".".join(binding.output_path) if binding.output_path else "*"
+            edge_label = f"{path} -> {param}".replace('"', "'")
+            lines.append(f'    {binding.task_id} -->|"{edge_label}"| {tid}')
+
+    return "\n".join(lines)
+
+
+def export_visual_artifacts(
+    *,
+    style: Style,
+    graph: Any,
+    artifacts: list[ScenarioArtifact],
+    selected: str,
+    planner_reasoning: bool,
+) -> None:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    png_path = RESULTS_DIR / "langgraph_workflow.png"
+    md_path = RESULTS_DIR / f"trace_{selected}.md"
+
+    png_saved = False
+    try:
+        graph.get_graph().draw_mermaid_png(output_file_path=str(png_path))
+        png_saved = True
+    except Exception as exc:  # noqa: BLE001
+        print(style.dim(f"\n  [export] Skipped PNG export ({type(exc).__name__}: {exc})"))
+
+    md_lines: list[str] = [
+        f"# LangGraph LLM Compiler Trace (`{selected}`)",
+        "",
+        f"- **Model**: `{MODEL_NAME}` (`planner reasoning={planner_reasoning}`, `joiner reasoning=False`)",
+        f"- **Scenarios**: {len(artifacts)}",
+        "",
+        "## LangGraph StateGraph",
+        "",
+    ]
+    if png_saved:
+        md_lines.extend([f"![LangGraph Workflow]({png_path.name})", ""])
+    md_lines.extend(
+        [
+            "```mermaid",
+            graph.get_graph().draw_mermaid().strip(),
+            "```",
+            "",
+        ]
+    )
+
+    for art in artifacts:
+        s = art.summary
+        dag = art.state.get("compiled_dag")
+        exec_res = art.state.get("execution_result")
+        answer = art.state.get("final_answer")
+
+        md_lines.extend(
+            [
+                f"## Scenario: `{art.scenario.name}` — {art.scenario.title}",
+                "",
+                f"> **User Request:** {art.scenario.request}",
+                "",
+                f"- **LangGraph path**: `{s.path}`",
+                (
+                    f"- **Timings**: Plan `{s.planning_ms / 1000:.2f}s` | "
+                    f"Compile `{s.compile_ms:.2f}ms` | "
+                    f"Exec `{s.exec_par_ms:.1f}ms` (seq `{s.exec_seq_ms:.1f}ms`, "
+                    f"speedup **`{s.speedup:.2f}x`**) | "
+                    f"Join `{s.joining_ms / 1000:.2f}s` | Overhead `{s.overhead_ms:.2f}ms`"
+                ),
+                f"- **Status**: `{s.joiner_status}` | **LLM calls**: `{s.llm_calls}`",
+                "",
+            ]
+        )
+
+        if dag is not None:
+            md_lines.extend(
+                [
+                    "### Compiled DAG",
+                    "",
+                    "```mermaid",
+                    render_dag_mermaid(dag, exec_res),
+                    "```",
+                    "",
+                ]
+            )
+
+        if exec_res is not None:
+            md_lines.extend(
+                [
+                    "### Task Execution Details",
+                    "",
+                    "| Task | Tool | Status | Window (ms) | Duration | Result / Error |",
+                    "| :--- | :--- | :---: | :---: | ---: | :--- |",
+                ]
+            )
+            for tid, res in exec_res.results.items():
+                if res.status == "success":
+                    win = f"{res.started_at_ms:.0f} -> {res.finished_at_ms:.0f}"
+                    detail = _format_output_human(res.tool_name, res.output)
+                elif res.status == "error":
+                    win = f"{res.started_at_ms or 0:.0f} -> {res.finished_at_ms or 0:.0f}"
+                    detail = f"{res.error_type}: {res.error}"
+                else:
+                    win = "skipped"
+                    detail = res.skip_reason or "upstream failed"
+                detail_safe = detail.replace("|", "\\|")
+                md_lines.append(
+                    f"| `{tid}` | `{res.tool_name}` | `{res.status}` | {win} | "
+                    f"{res.duration_ms:.1f} ms | {detail_safe} |"
+                )
+            md_lines.append("")
+
+        if answer:
+            md_lines.extend(["### Final Answer", "", answer, ""])
+
+    md_path.write_text("\n".join(md_lines), encoding="utf-8")
+
+    print(f"\n{style.dim('─' * MAX_COL)}")
+    if png_saved:
+        print(f"  {style.green('Saved PNG')}    : {png_path}")
+    print(f"  {style.green('Saved Report')} : {md_path}")
+
+
+# =============================================================================
+# Single scenario runner via LangGraph astream
 # =============================================================================
 
 
 async def run_scenario(
+    *,
+    style: Style,
     scenario: Scenario,
-    catalog: dict[str, str],
-    planner: Planner,
-    compiler: PlanCompiler,
-    parallel_executor: Executor,
+    graph: Any,
     sequential_executor: Executor,
-    joiner: Joiner,
-) -> ScenarioSummary:
-    print_banner(f"SCENARIO: {scenario.name} — {scenario.title}")
-    llm_calls = 0
+    show_json: bool,
+) -> ScenarioArtifact:
+    print_question(style, scenario)
 
-    # 2. Planner
-    t0 = time.perf_counter()
-    llm_calls += 1
-    try:
-        plan = await planner.aplan(request=scenario.request, available_tools=catalog)
-        planning_ms = (time.perf_counter() - t0) * 1000.0
-    except PlannerOutputError as exc:
-        planning_ms = (time.perf_counter() - t0) * 1000.0
-        print_header("2/6", "PLANNER", f"Parsing error ({planning_ms:.2f} ms)")
-        print(exc)
-        print("RAW OUTPUT:", exc.raw_output)
-        return ScenarioSummary(
-            name=scenario.name,
-            plan_valid=False,
-            nodes=0,
-            levels=0,
-            planning_ms=planning_ms,
-            compile_ms=0.0,
-            exec_par_ms=0.0,
-            exec_seq_ms=0.0,
-            joining_ms=0.0,
-            effective_parallelism=0.0,
-            speedup=0.0,
-            success_rate=0.0,
-            joiner_status="parse_err",
-            llm_calls=llm_calls,
-        )
+    visited_nodes: list[str] = ["START"]
+    final_state: CompilerState = {"request": scenario.request}
+    seq_res: ExecutionResult | None = None
 
-    print_planner_section(scenario, MODEL_NAME, plan, planning_ms)
+    wall_t0 = time.perf_counter()
+    async for chunk in graph.astream({"request": scenario.request}):
+        for node_name, update in chunk.items():
+            visited_nodes.append(node_name)
+            final_state.update(update)
 
-    # 3. Compiler
-    t1 = time.perf_counter()
-    try:
-        dag = compiler.compile(plan)
-        compile_ms = (time.perf_counter() - t1) * 1000.0
-    except PlanCompilationError as exc:
-        compile_ms = (time.perf_counter() - t1) * 1000.0
-        print_header("3/6", "PLAN COMPILER", f"Compilation error ({compile_ms:.2f} ms)")
-        print(exc)
-        return ScenarioSummary(
-            name=scenario.name,
-            plan_valid=False,
-            nodes=len(plan.tasks),
-            levels=0,
-            planning_ms=planning_ms,
-            compile_ms=compile_ms,
-            exec_par_ms=0.0,
-            exec_seq_ms=0.0,
-            joining_ms=0.0,
-            effective_parallelism=0.0,
-            speedup=0.0,
-            success_rate=0.0,
-            joiner_status="comp_err",
-            llm_calls=llm_calls,
-        )
+            if node_name == "planner":
+                print_planner_phase(style, update, show_json=show_json)
+            elif node_name == "compiler":
+                print_compiler_phase(style, update)
+            elif node_name == "executor":
+                dag = final_state.get("compiled_dag")
+                exec_res = update.get("execution_result")
+                if dag is not None and exec_res is not None:
+                    seq_t0 = time.perf_counter()
+                    seq_res = await sequential_executor.execute(dag)
+                    wall_t0 += time.perf_counter() - seq_t0
+                print_executor_phase(style, update, seq_res)
+            elif node_name == "joiner":
+                print_joiner_phase(style, update)
 
-    print_compiler_section(dag, compile_ms)
+    graph_wall_ms = (time.perf_counter() - wall_t0) * 1000.0
+    visited_nodes.append("END")
 
-    # 4. Executor (parallel vs sequential baseline on the same CompiledDAG)
-    parallel_res = await parallel_executor.execute(dag)
-    sequential_res = await sequential_executor.execute(dag)
-    print_executor_section(parallel_res, sequential_res)
+    metrics = final_state["metrics"]
+    dag = final_state.get("compiled_dag")
+    exec_res = final_state.get("execution_result")
 
-    # 5. Joiner
-    t2 = time.perf_counter()
-    llm_calls += 1
-    try:
-        joiner_res = await joiner.join(
-            request=scenario.request,
-            execution_result=parallel_res,
-            plan=plan,
-        )
-        joining_ms = (time.perf_counter() - t2) * 1000.0
-    except JoinerOutputError as exc:
-        joining_ms = (time.perf_counter() - t2) * 1000.0
-        print_header("5/6", "JOINER", f"Parsing error ({joining_ms:.2f} ms)")
-        print(exc)
-        print("RAW OUTPUT:", exc.raw_output)
-        joiner_res = None
-
-    if joiner_res is not None:
-        print_joiner_section(MODEL_NAME, joiner_res, joining_ms)
-
-    total_tasks = len(parallel_res.results)
+    total_tasks = len(exec_res.results) if exec_res is not None else 0
     success_rate = (
-        len(parallel_res.succeeded_task_ids) / total_tasks * 100.0
-        if total_tasks
-        else 0.0
+        len(exec_res.succeeded_task_ids) / total_tasks * 100.0 if total_tasks else 0.0
     )
-    speedup = (
-        sequential_res.total_duration_ms / parallel_res.total_duration_ms
-        if parallel_res.total_duration_ms > 0
-        else 0.0
-    )
+    exec_par_ms = exec_res.total_duration_ms if exec_res is not None else 0.0
+    exec_seq_ms = seq_res.total_duration_ms if seq_res is not None else 0.0
+    speedup = (exec_seq_ms / exec_par_ms) if exec_par_ms > 0 and exec_seq_ms > 0 else 0.0
 
     summary = ScenarioSummary(
         name=scenario.name,
-        plan_valid=True,
-        nodes=len(dag.tasks),
-        levels=len(dag.levels),
-        planning_ms=planning_ms,
-        compile_ms=compile_ms,
-        exec_par_ms=parallel_res.total_duration_ms,
-        exec_seq_ms=sequential_res.total_duration_ms,
-        joining_ms=joining_ms,
-        effective_parallelism=parallel_res.effective_parallelism,
+        path=" → ".join(visited_nodes),
+        plan_valid=bool(metrics.plan_valid),
+        nodes=len(dag.tasks) if dag is not None else 0,
+        levels=len(dag.levels) if dag is not None else 0,
+        planning_ms=metrics.planning_latency_ms or 0.0,
+        compile_ms=metrics.compilation_latency_ms or 0.0,
+        exec_par_ms=exec_par_ms,
+        exec_seq_ms=exec_seq_ms,
+        joining_ms=metrics.joining_latency_ms or 0.0,
+        graph_wall_ms=graph_wall_ms,
+        overhead_ms=max(0.0, graph_wall_ms - metrics.component_latency_ms),
+        effective_parallelism=exec_res.effective_parallelism if exec_res else 0.0,
         speedup=speedup,
         success_rate=success_rate,
-        joiner_status=joiner_res.status if joiner_res is not None else "join_err",
-        llm_calls=llm_calls,
+        joiner_status=final_state.get("status") or "failed",
+        llm_calls=metrics.llm_calls,
     )
-    print_metrics_summary(summary)
-    return summary
+    print_scenario_footer(style, summary)
+    return ScenarioArtifact(scenario=scenario, summary=summary, state=final_state)
 
 
 # =============================================================================
@@ -639,14 +915,16 @@ async def run_scenario(
 # =============================================================================
 
 
-async def main(selected: str, reasoning: bool) -> None:
+async def main(
+    *,
+    selected: str,
+    reasoning: bool,
+    show_json: bool,
+    use_color: bool,
+    export: bool,
+) -> None:
+    style = Style(enabled=use_color)
     registry = build_registry()
-    catalog = registry.to_planner_catalog()
-    print_registry_section(registry, catalog)
-    print(
-        f"Model config: {MODEL_NAME} "
-        f"(planner reasoning={reasoning}, joiner reasoning=False, temperature=0.0)"
-    )
 
     planner_llm = create_ollama_chat_model(
         model=MODEL_NAME,
@@ -658,11 +936,22 @@ async def main(selected: str, reasoning: bool) -> None:
         temperature=0.0,
         reasoning=False,
     )
+
     planner = Planner(llm=planner_llm)
     compiler = PlanCompiler(registry=registry)
     parallel_executor = Executor(registry=registry, max_concurrency=8)
     sequential_executor = Executor(registry=registry, max_concurrency=1)
     joiner = Joiner(llm=joiner_llm)
+
+    graph = build_compiler_graph(
+        registry=registry,
+        planner=planner,
+        compiler=compiler,
+        executor=parallel_executor,
+        joiner=joiner,
+    )
+
+    print_setup(style, registry, graph, planner_reasoning=reasoning)
 
     chosen_scenarios = (
         list(SCENARIOS)
@@ -670,26 +959,33 @@ async def main(selected: str, reasoning: bool) -> None:
         else [s for s in SCENARIOS if s.name == selected]
     )
 
-    summaries: list[ScenarioSummary] = []
+    artifacts: list[ScenarioArtifact] = []
     for scenario in chosen_scenarios:
-        summary = await run_scenario(
+        artifact = await run_scenario(
+            style=style,
             scenario=scenario,
-            catalog=catalog,
-            planner=planner,
-            compiler=compiler,
-            parallel_executor=parallel_executor,
+            graph=graph,
             sequential_executor=sequential_executor,
-            joiner=joiner,
+            show_json=show_json,
         )
-        summaries.append(summary)
+        artifacts.append(artifact)
 
-    if len(summaries) > 1:
-        print_comparative_table(summaries)
+    if len(artifacts) > 1:
+        print_comparative_table(style, [a.summary for a in artifacts])
+
+    if export:
+        export_visual_artifacts(
+            style=style,
+            graph=graph,
+            artifacts=artifacts,
+            selected=selected,
+            planner_reasoning=reasoning,
+        )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Multi-scenario stress test for Planner -> Compiler -> Executor -> Joiner."
+        description="Clean visual step-by-step LangGraph LLM Compiler trace."
     )
     parser.add_argument(
         "--scenario",
@@ -700,7 +996,30 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no-reasoning",
         action="store_true",
-        help="Disable Qwen3 reasoning mode (enabled by default).",
+        help="Disable Qwen3 reasoning mode on Planner (enabled by default).",
+    )
+    parser.add_argument(
+        "--show-json",
+        action="store_true",
+        help="Also print the raw ExecutionPlan JSON in Phase 1.",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI terminal colors.",
+    )
+    parser.add_argument(
+        "--no-export",
+        action="store_true",
+        help="Skip exporting PNG and Markdown Mermaid report to results/.",
     )
     args = parser.parse_args()
-    asyncio.run(main(args.scenario, reasoning=not args.no_reasoning))
+    asyncio.run(
+        main(
+            selected=args.scenario,
+            reasoning=not args.no_reasoning,
+            show_json=args.show_json,
+            use_color=(not args.no_color) and sys.stdout.isatty(),
+            export=not args.no_export,
+        )
+    )

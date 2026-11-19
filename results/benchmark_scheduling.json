@@ -1,0 +1,71 @@
+{
+  "benchmark": "deterministic_scheduling",
+  "timestamp_utc": "20261119T220635Z",
+  "repeats": 3,
+  "results": [
+    {
+      "name": "symmetric_fanout",
+      "title": "Symmetric Fan-Out (fairness control)",
+      "nodes": 5,
+      "levels": 2,
+      "repeats": 3,
+      "seq_median_ms": 522.31,
+      "bsp_exec_median_ms": 164.25,
+      "bsp_compile_median_ms": 2.65,
+      "bsp_total_median_ms": 166.9,
+      "event_median_ms": 160.84,
+      "speedup_bsp": 3.18,
+      "speedup_event": 3.25,
+      "event_vs_bsp_gain_pct": 2.1,
+      "event_vs_bsp_saved_ms": 3.4
+    },
+    {
+      "name": "asymmetric_branches",
+      "title": "Asymmetric 2-Branch Diamond",
+      "nodes": 5,
+      "levels": 3,
+      "repeats": 3,
+      "seq_median_ms": 703.01,
+      "bsp_exec_median_ms": 606.22,
+      "bsp_compile_median_ms": 2.79,
+      "bsp_total_median_ms": 609.02,
+      "event_median_ms": 401.69,
+      "speedup_bsp": 1.16,
+      "speedup_event": 1.75,
+      "event_vs_bsp_gain_pct": 33.7,
+      "event_vs_bsp_saved_ms": 204.54
+    },
+    {
+      "name": "staggered_multi_branch",
+      "title": "Multi-Branch Diamond (real test2 profile)",
+      "nodes": 8,
+      "levels": 3,
+      "repeats": 3,
+      "seq_median_ms": 904.38,
+      "bsp_exec_median_ms": 467.45,
+      "bsp_compile_median_ms": 4.21,
+      "bsp_total_median_ms": 471.67,
+      "event_median_ms": 421.88,
+      "speedup_bsp": 1.93,
+      "speedup_event": 2.14,
+      "event_vs_bsp_gain_pct": 9.7,
+      "event_vs_bsp_saved_ms": 45.57
+    },
+    {
+      "name": "deep_asymmetric_pipeline",
+      "title": "Deep 4-Level Asymmetric Pipeline",
+      "nodes": 7,
+      "levels": 4,
+      "repeats": 3,
+      "seq_median_ms": 664.49,
+      "bsp_exec_median_ms": 548.85,
+      "bsp_compile_median_ms": 3.94,
+      "bsp_total_median_ms": 552.79,
+      "event_median_ms": 383.6,
+      "speedup_bsp": 1.21,
+      "speedup_event": 1.73,
+      "event_vs_bsp_gain_pct": 30.1,
+      "event_vs_bsp_saved_ms": 165.25
+    }
+  ]
+}
