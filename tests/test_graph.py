@@ -481,3 +481,252 @@ def test_graph_streaming_order_and_mermaid_export():
     mermaid = graph.get_graph().draw_mermaid()
     for node_name in ("planner", "compiler", "executor", "joiner"):
         assert node_name in mermaid
+    # v1 (max_compile_retries=0) must not expose a compiler -> planner cycle.
+    assert "compiler -.-> planner" not in mermaid
+
+
+class SequenceStructuredRunnable:
+    """Fake runnable returning a sequence of responses across retries."""
+
+    def __init__(self, responses: list[dict[str, Any]]) -> None:
+        self._responses = list(responses)
+        self.received_messages: list[list[Any]] = []
+
+    async def ainvoke(self, messages: list[Any]) -> dict[str, Any]:
+        self.received_messages.append(messages)
+        idx = min(len(self.received_messages) - 1, len(self._responses) - 1)
+        return self._responses[idx]
+
+
+class SequenceChatModel:
+    def __init__(self, responses: list[dict[str, Any]]) -> None:
+        self.runnable = SequenceStructuredRunnable(responses)
+
+    def with_structured_output(self, **kwargs: Any) -> SequenceStructuredRunnable:
+        return self.runnable
+
+
+def _malformed_binding_plan() -> ExecutionPlan:
+    return ExecutionPlan.model_validate(
+        {
+            "objective": "Compute Italy minus France population.",
+            "tasks": [
+                {
+                    "task_id": "task_1",
+                    "tool_name": "population_lookup",
+                    "description": "Get Italy population.",
+                    "inputs": {"country": "Italy"},
+                },
+                {
+                    "task_id": "task_2",
+                    "tool_name": "population_lookup",
+                    "description": "Get France population.",
+                    "inputs": {"country": "France"},
+                },
+                {
+                    "task_id": "task_3",
+                    "tool_name": "calculator",
+                    "description": "Subtract France from Italy.",
+                    "inputs": {
+                        "operation": "subtract",
+                        "a": {"task_id": "task_1", "output_path": ["population"]},
+                        "b": {"task_id": "task_2", "output, path": ["population"]},
+                    },
+                },
+            ],
+        }
+    )
+
+
+def test_graph_rejects_negative_max_compile_retries():
+    registry = _build_registry()
+    planner_llm = FakeChatModel(
+        {"parsed": _valid_plan(), "parsing_error": None, "raw": "{}"}
+    )
+    joiner_llm = FakeChatModel(
+        {"parsed": JoinerOutput(answer="ok"), "parsing_error": None, "raw": "{}"}
+    )
+
+    with pytest.raises(ValueError, match="max_compile_retries"):
+        build_compiler_graph(
+            registry=registry,
+            planner=Planner(llm=planner_llm),  # type: ignore[arg-type]
+            compiler=PlanCompiler(registry=registry),
+            executor=Executor(registry=registry),
+            joiner=Joiner(llm=joiner_llm),  # type: ignore[arg-type]
+            max_compile_retries=-1,
+        )
+
+
+def test_graph_v2_self_correction_recovers_on_first_retry():
+    registry = _build_registry()
+    bad_plan = _malformed_binding_plan()
+    good_plan = _valid_plan()
+
+    planner_llm = SequenceChatModel(
+        [
+            {"parsed": bad_plan, "parsing_error": None, "raw": "{bad}"},
+            {"parsed": good_plan, "parsing_error": None, "raw": "{good}"},
+        ]
+    )
+    joiner_llm = FakeChatModel(
+        {
+            "parsed": JoinerOutput(answer="Differenza: -9.410.000."),
+            "parsing_error": None,
+            "raw": "{}",
+        }
+    )
+
+    graph = build_compiler_graph(
+        registry=registry,
+        planner=Planner(llm=planner_llm),  # type: ignore[arg-type]
+        compiler=PlanCompiler(registry=registry),
+        executor=Executor(registry=registry),
+        joiner=Joiner(llm=joiner_llm),  # type: ignore[arg-type]
+        max_compile_retries=2,
+    )
+
+    # v2 topology exposes the compiler -> planner feedback edge.
+    assert "compiler -.-> planner" in graph.get_graph().draw_mermaid()
+
+    final_state = asyncio.run(graph.ainvoke({"request": "Italia meno Francia"}))
+
+    assert final_state["status"] == "complete"
+    assert final_state["error"] is None
+    assert final_state["compile_feedback"] is None
+    assert final_state["final_answer"] == "Differenza: -9.410.000."
+    assert final_state["plan"] == good_plan
+    assert final_state["execution_result"] is not None
+    assert final_state["execution_result"].results["task_3"].output == {
+        "result": -9_410_000.0
+    }
+
+    # Verify the retry prompt actually received previous_plan + malformed_binding issue.
+    assert len(planner_llm.runnable.received_messages) == 2
+    retry_human_msg = planner_llm.runnable.received_messages[1][1].content
+    assert "PREVIOUS EXECUTION PLAN (FAILED COMPILATION):" in retry_human_msg
+    assert "malformed_binding" in retry_human_msg
+    assert "output, path" in retry_human_msg
+
+    # Verify error history preserved even after successful recovery.
+    history = final_state["compile_error_history"]
+    assert len(history) == 1
+    assert any("malformed_binding" in item for item in history[0])
+
+    metrics = final_state["metrics"]
+    assert metrics.plan_valid is True
+    assert metrics.compile_attempts == 2
+    assert metrics.compile_retries == 1
+    assert metrics.llm_calls == 3  # 2 planner + 1 joiner
+    assert metrics.planning_latency_ms is not None
+    assert metrics.compilation_latency_ms is not None
+
+
+def test_graph_v2_stops_when_compile_retry_budget_exhausted():
+    registry = _build_registry()
+    bad_plan = _malformed_binding_plan()
+
+    planner_llm = SequenceChatModel(
+        [
+            {"parsed": bad_plan, "parsing_error": None, "raw": "{bad1}"},
+            {"parsed": bad_plan, "parsing_error": None, "raw": "{bad2}"},
+            {"parsed": _valid_plan(), "parsing_error": None, "raw": "{unused}"},
+        ]
+    )
+    joiner_llm = FakeChatModel(
+        {"parsed": JoinerOutput(answer="should not run"), "parsing_error": None, "raw": "{}"}
+    )
+
+    graph = build_compiler_graph(
+        registry=registry,
+        planner=Planner(llm=planner_llm),  # type: ignore[arg-type]
+        compiler=PlanCompiler(registry=registry),
+        executor=Executor(registry=registry),
+        joiner=Joiner(llm=joiner_llm),  # type: ignore[arg-type]
+        max_compile_retries=1,
+    )
+
+    final_state = asyncio.run(graph.ainvoke({"request": "Italia meno Francia"}))
+
+    assert final_state["status"] == "failed"
+    assert final_state["error"] is not None
+    assert final_state["error"].stage == "compiler"
+    assert final_state["error"].error_type == "PlanCompilationError"
+    assert "execution_result" not in final_state
+    assert joiner_llm.runnable.call_count == 0
+    assert len(final_state["compile_error_history"]) == 2
+
+    metrics = final_state["metrics"]
+    assert metrics.plan_valid is False
+    assert metrics.compile_attempts == 2
+    assert metrics.compile_retries == 1
+    assert metrics.llm_calls == 2
+
+
+def test_graph_v2_does_not_retry_planner_output_error():
+    registry = _build_registry()
+    planner_llm = SequenceChatModel(
+        [
+            {"parsed": None, "parsing_error": ValueError("bad json"), "raw": "{"},
+            {"parsed": _valid_plan(), "parsing_error": None, "raw": "{}"},
+        ]
+    )
+    joiner_llm = FakeChatModel(
+        {"parsed": JoinerOutput(answer="nope"), "parsing_error": None, "raw": "{}"}
+    )
+
+    graph = build_compiler_graph(
+        registry=registry,
+        planner=Planner(llm=planner_llm),  # type: ignore[arg-type]
+        compiler=PlanCompiler(registry=registry),
+        executor=Executor(registry=registry),
+        joiner=Joiner(llm=joiner_llm),  # type: ignore[arg-type]
+        max_compile_retries=2,
+    )
+
+    final_state = asyncio.run(graph.ainvoke({"request": "Italia meno Francia"}))
+
+    assert final_state["status"] == "failed"
+    assert final_state["error"] is not None
+    assert final_state["error"].stage == "planner"
+    assert final_state["metrics"].llm_calls == 1
+    assert final_state["metrics"].compile_attempts == 0
+    assert final_state["metrics"].compile_retries == 0
+
+
+def test_graph_v2_streaming_order_with_compile_retry():
+    registry = _build_registry()
+    planner_llm = SequenceChatModel(
+        [
+            {"parsed": _malformed_binding_plan(), "parsing_error": None, "raw": "{}"},
+            {"parsed": _valid_plan(), "parsing_error": None, "raw": "{}"},
+        ]
+    )
+    joiner_llm = FakeChatModel(
+        {"parsed": JoinerOutput(answer="ok"), "parsing_error": None, "raw": "{}"}
+    )
+
+    graph = build_compiler_graph(
+        registry=registry,
+        planner=Planner(llm=planner_llm),  # type: ignore[arg-type]
+        compiler=PlanCompiler(registry=registry),
+        executor=Executor(registry=registry),
+        joiner=Joiner(llm=joiner_llm),  # type: ignore[arg-type]
+        max_compile_retries=2,
+    )
+
+    async def collect() -> list[str]:
+        visited: list[str] = []
+        async for chunk in graph.astream({"request": "Italia meno Francia"}):
+            visited.extend(chunk.keys())
+        return visited
+
+    assert asyncio.run(collect()) == [
+        "planner",
+        "compiler",
+        "planner",
+        "compiler",
+        "executor",
+        "joiner",
+    ]
+

@@ -21,14 +21,23 @@ def make_planner_node(
     async def planner_node(state: CompilerState) -> dict[str, object]:
         current_metrics = state.get("metrics") or WorkflowMetrics()
         request = state["request"]
+        feedback = state.get("compile_feedback")
+        previous_plan = state.get("plan") if feedback else None
 
         t0 = time.perf_counter()
         try:
-            plan = await planner.aplan(request=request, available_tools=catalog)
+            plan = await planner.aplan(
+                request=request,
+                available_tools=catalog,
+                previous_plan=previous_plan,
+                feedback=feedback,
+            )
         except ValueError as exc:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            total_planning_ms = (current_metrics.planning_latency_ms or 0.0) + elapsed_ms
             return {
                 "plan": None,
+                "compile_feedback": None,
                 "status": "failed",
                 "error": WorkflowError(
                     stage="planner",
@@ -37,14 +46,16 @@ def make_planner_node(
                 ),
                 "metrics": update_metrics(
                     state,
-                    planning_latency_ms=elapsed_ms,
+                    planning_latency_ms=total_planning_ms,
                     plan_valid=None,
                 ),
             }
         except PlannerOutputError as exc:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            total_planning_ms = (current_metrics.planning_latency_ms or 0.0) + elapsed_ms
             return {
                 "plan": None,
+                "compile_feedback": None,
                 "status": "failed",
                 "error": WorkflowError(
                     stage="planner",
@@ -53,15 +64,17 @@ def make_planner_node(
                 ),
                 "metrics": update_metrics(
                     state,
-                    planning_latency_ms=elapsed_ms,
+                    planning_latency_ms=total_planning_ms,
                     llm_calls=current_metrics.llm_calls + 1,
                     plan_valid=None,
                 ),
             }
         except Exception as exc:  # noqa: BLE001
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            total_planning_ms = (current_metrics.planning_latency_ms or 0.0) + elapsed_ms
             return {
                 "plan": None,
+                "compile_feedback": None,
                 "status": "failed",
                 "error": WorkflowError(
                     stage="planner",
@@ -70,19 +83,22 @@ def make_planner_node(
                 ),
                 "metrics": update_metrics(
                     state,
-                    planning_latency_ms=elapsed_ms,
+                    planning_latency_ms=total_planning_ms,
                     llm_calls=current_metrics.llm_calls + 1,
                     plan_valid=None,
                 ),
             }
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        total_planning_ms = (current_metrics.planning_latency_ms or 0.0) + elapsed_ms
         return {
             "plan": plan,
+            "compile_feedback": None,
+            "status": None,
             "error": None,
             "metrics": update_metrics(
                 state,
-                planning_latency_ms=elapsed_ms,
+                planning_latency_ms=total_planning_ms,
                 llm_calls=current_metrics.llm_calls + 1,
             ),
         }
@@ -99,6 +115,7 @@ def make_compiler_node(compiler: PlanCompiler) -> GraphNode:
         if plan is None:
             return {
                 "compiled_dag": None,
+                "compile_feedback": None,
                 "status": "failed",
                 "error": WorkflowError(
                     stage="compiler",
@@ -114,26 +131,34 @@ def make_compiler_node(compiler: PlanCompiler) -> GraphNode:
             dag = compiler.compile(plan)
         except PlanCompilationError as exc:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            total_comp_ms = (current_metrics.compilation_latency_ms or 0.0) + elapsed_ms
+            formatted_issues = [issue.format() for issue in exc.issues]
+            feedback_text = "\n".join(f"- {item}" for item in formatted_issues)
+            history = [*state.get("compile_error_history", []), formatted_issues]
             return {
                 "compiled_dag": None,
+                "compile_feedback": feedback_text,
+                "compile_error_history": history,
                 "status": "failed",
                 "error": WorkflowError(
                     stage="compiler",
                     error_type=type(exc).__name__,
                     message=str(exc),
-                    issues=[issue.format() for issue in exc.issues],
+                    issues=formatted_issues,
                 ),
                 "metrics": update_metrics(
                     state,
-                    compilation_latency_ms=elapsed_ms,
+                    compilation_latency_ms=total_comp_ms,
                     compile_attempts=attempts,
                     plan_valid=False,
                 ),
             }
         except Exception as exc:  # noqa: BLE001
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            total_comp_ms = (current_metrics.compilation_latency_ms or 0.0) + elapsed_ms
             return {
                 "compiled_dag": None,
+                "compile_feedback": None,
                 "status": "failed",
                 "error": WorkflowError(
                     stage="compiler",
@@ -142,19 +167,22 @@ def make_compiler_node(compiler: PlanCompiler) -> GraphNode:
                 ),
                 "metrics": update_metrics(
                     state,
-                    compilation_latency_ms=elapsed_ms,
+                    compilation_latency_ms=total_comp_ms,
                     compile_attempts=attempts,
                     plan_valid=False,
                 ),
             }
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        total_comp_ms = (current_metrics.compilation_latency_ms or 0.0) + elapsed_ms
         return {
             "compiled_dag": dag,
+            "compile_feedback": None,
+            "status": None,
             "error": None,
             "metrics": update_metrics(
                 state,
-                compilation_latency_ms=elapsed_ms,
+                compilation_latency_ms=total_comp_ms,
                 compile_attempts=attempts,
                 plan_valid=True,
             ),

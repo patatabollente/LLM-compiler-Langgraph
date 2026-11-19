@@ -922,6 +922,7 @@ async def main(
     show_json: bool,
     use_color: bool,
     export: bool,
+    max_compile_retries: int,
 ) -> None:
     style = Style(enabled=use_color)
     registry = build_registry()
@@ -949,6 +950,7 @@ async def main(
         compiler=compiler,
         executor=parallel_executor,
         joiner=joiner,
+        max_compile_retries=max_compile_retries,
     )
 
     print_setup(style, registry, graph, planner_reasoning=reasoning)
@@ -1013,6 +1015,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip exporting PNG and Markdown Mermaid report to results/.",
     )
+    parser.add_argument(
+        "--max-compile-retries",
+        type=int,
+        default=2,
+        help="Max compile-time self-correction retries (default: 2; use 0 for v1 linear).",
+    )
     args = parser.parse_args()
     asyncio.run(
         main(
@@ -1021,5 +1029,6 @@ if __name__ == "__main__":
             show_json=args.show_json,
             use_color=(not args.no_color) and sys.stdout.isatty(),
             export=not args.no_export,
+            max_compile_retries=args.max_compile_retries,
         )
     )

@@ -41,6 +41,11 @@ class WorkflowMetrics(BaseModel):
     plan_valid: bool | None = None
 
     @property
+    def compile_retries(self) -> int:
+        """Number of compile-time self-correction retries actually performed."""
+        return max(0, self.compile_attempts - 1)
+
+    @property
     def component_latency_ms(self) -> float:
         """Sum of recorded latencies for executed components (excludes graph overhead)."""
         latencies = (
@@ -53,7 +58,7 @@ class WorkflowMetrics(BaseModel):
 
 
 class CompilerState(TypedDict, total=False):
-    """Shared state passed through the LangGraph LLM Compiler v1 workflow."""
+    """Shared state passed through the LangGraph LLM Compiler workflow."""
 
     request: Required[str]
     plan: NotRequired[ExecutionPlan | None]
@@ -63,6 +68,8 @@ class CompilerState(TypedDict, total=False):
     final_answer: NotRequired[str | None]
     status: NotRequired[WorkflowStatus | None]
     error: NotRequired[WorkflowError | None]
+    compile_feedback: NotRequired[str | None]
+    compile_error_history: NotRequired[list[list[str]]]
     metrics: NotRequired[WorkflowMetrics]
 
 

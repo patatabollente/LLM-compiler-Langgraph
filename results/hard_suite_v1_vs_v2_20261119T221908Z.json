@@ -1,0 +1,454 @@
+{
+  "benchmark": "hard_suite_v1_vs_v2",
+  "timestamp_utc": "20261119T221908Z",
+  "model": "qwen3:8b",
+  "planner_reasoning": false,
+  "joiner_reasoning": false,
+  "catalog_size": 10,
+  "summaries": [
+    {
+      "version": "v1 (retries=0)",
+      "max_compile_retries": 0,
+      "cases_total": 6,
+      "plan_valid_count": 2,
+      "plan_validity_pct": 33.3,
+      "status_ok_count": 2,
+      "numeric_exact_count": 1,
+      "numeric_exact_pct": 16.7,
+      "recovered_via_retry_count": 0,
+      "total_compile_retries": 0,
+      "total_llm_calls": 8,
+      "median_wall_ms": 5278.13,
+      "median_speedup": 2.43,
+      "compile_issue_breakdown": {
+        "invalid_static_argument": 6,
+        "malformed_binding": 2,
+        "unknown_argument": 1
+      }
+    },
+    {
+      "version": "v2 (retries=2)",
+      "max_compile_retries": 2,
+      "cases_total": 6,
+      "plan_valid_count": 5,
+      "plan_validity_pct": 83.3,
+      "status_ok_count": 5,
+      "numeric_exact_count": 3,
+      "numeric_exact_pct": 50.0,
+      "recovered_via_retry_count": 3,
+      "total_compile_retries": 5,
+      "total_llm_calls": 16,
+      "median_wall_ms": 11639.61,
+      "median_speedup": 2.27,
+      "compile_issue_breakdown": {
+        "invalid_static_argument": 10,
+        "malformed_binding": 2,
+        "unknown_argument": 1
+      }
+    }
+  ],
+  "records": [
+    {
+      "case_id": "h01_deep_nested_fx",
+      "category": "3-level nested path + FX",
+      "version": "v1 (retries=0)",
+      "max_compile_retries": 0,
+      "plan_valid": false,
+      "status": "failed",
+      "status_ok": false,
+      "numeric_ok": false,
+      "missing_numbers": [
+        4163.0,
+        3781.2,
+        381.8
+      ],
+      "compile_attempts": 1,
+      "compile_retries": 0,
+      "compile_error_history": [
+        [
+          "[invalid_static_argument] (task 'task_4', field 'from_unit'): Invalid static value for parameter 'from_unit' of tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'.",
+          "[invalid_static_argument] (task 'task_4', field 'to_unit'): Invalid static value for parameter 'to_unit' of tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'.",
+          "[invalid_static_argument] (task 'task_5', field 'from_unit'): Invalid static value for parameter 'from_unit' of tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'.",
+          "[invalid_static_argument] (task 'task_5', field 'to_unit'): Invalid static value for parameter 'to_unit' of tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'."
+        ]
+      ],
+      "error_stage": "compiler",
+      "error_type": "PlanCompilationError",
+      "dag_nodes": 0,
+      "dag_levels": 0,
+      "planning_ms": 5167.343385999629,
+      "compilation_ms": 0.6022480001774966,
+      "execution_ms": null,
+      "sequential_ms": null,
+      "joining_ms": null,
+      "graph_wall_ms": 5171.599647999756,
+      "speedup": null,
+      "llm_calls": 1,
+      "final_answer": null
+    },
+    {
+      "case_id": "h02_co2_per_million",
+      "category": "cross-tool join + pct",
+      "version": "v1 (retries=0)",
+      "max_compile_retries": 0,
+      "plan_valid": false,
+      "status": "failed",
+      "status_ok": false,
+      "numeric_ok": false,
+      "missing_numbers": [
+        5.34,
+        8.07,
+        51.16
+      ],
+      "compile_attempts": 1,
+      "compile_retries": 0,
+      "compile_error_history": [
+        [
+          "[malformed_binding] (task 'task_5', field 'right'): Parameter 'right' looks like a malformed InputBinding (allowed keys: 'task_id', 'output_path'): divided_by: Extra inputs are not permitted.",
+          "[malformed_binding] (task 'task_6', field 'right'): Parameter 'right' looks like a malformed InputBinding (allowed keys: 'task_id', 'output_path'): divided_by: Extra inputs are not permitted."
+        ]
+      ],
+      "error_stage": "compiler",
+      "error_type": "PlanCompilationError",
+      "dag_nodes": 0,
+      "dag_levels": 0,
+      "planning_ms": 5382.593328999974,
+      "compilation_ms": 0.3567479998309864,
+      "execution_ms": null,
+      "sequential_ms": null,
+      "joining_ms": null,
+      "graph_wall_ms": 5384.652052000092,
+      "speedup": null,
+      "llm_calls": 1,
+      "final_answer": null
+    },
+    {
+      "case_id": "h03_renewable_twh_groups",
+      "category": "4-country multi-stage",
+      "version": "v1 (retries=0)",
+      "max_compile_retries": 0,
+      "plan_valid": true,
+      "status": "complete",
+      "status_ok": true,
+      "numeric_ok": false,
+      "missing_numbers": [
+        252.75,
+        393.9
+      ],
+      "compile_attempts": 1,
+      "compile_retries": 0,
+      "compile_error_history": [],
+      "error_stage": null,
+      "error_type": null,
+      "dag_nodes": 10,
+      "dag_levels": 3,
+      "planning_ms": 9045.007538999926,
+      "compilation_ms": 0.543303999620548,
+      "execution_ms": 283.4434810001767,
+      "sequential_ms": 745.5008860006274,
+      "joining_ms": 1404.9655069993605,
+      "graph_wall_ms": 10737.553683999977,
+      "speedup": 2.6303885253149057,
+      "llm_calls": 2,
+      "final_answer": "For Italy, the renewable electricity output is 11,275 TWh. For Spain, it is 14,000 TWh. For Germany, it is 26,520 TWh. For France, it is 12,870 TWh. The combined renewable TWh of Italy and Spain is 25,275 TWh. The combined renewable TWh of Germany and France is 39,390 TWh."
+    },
+    {
+      "case_id": "h04_tax_fx_chain",
+      "category": "FX + country_code enum",
+      "version": "v1 (retries=0)",
+      "max_compile_retries": 0,
+      "plan_valid": false,
+      "status": "failed",
+      "status_ok": false,
+      "numeric_ok": false,
+      "missing_numbers": [
+        184000.0,
+        114080.0,
+        104880.0,
+        9200.0
+      ],
+      "compile_attempts": 1,
+      "compile_retries": 0,
+      "compile_error_history": [
+        [
+          "[invalid_static_argument] (task 'task_2', field 'from_unit'): Invalid static value for tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'.",
+          "[invalid_static_argument] (task 'task_2', field 'to_unit'): Invalid static value for tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'."
+        ]
+      ],
+      "error_stage": "compiler",
+      "error_type": "PlanCompilationError",
+      "dag_nodes": 0,
+      "dag_levels": 0,
+      "planning_ms": 4592.303250000441,
+      "compilation_ms": 0.2740259997153771,
+      "execution_ms": null,
+      "sequential_ms": null,
+      "joining_ms": null,
+      "graph_wall_ms": 4594.878762000008,
+      "speedup": null,
+      "llm_calls": 1,
+      "final_answer": null
+    },
+    {
+      "case_id": "h05_misery_index",
+      "category": "multi-branch + pct",
+      "version": "v1 (retries=0)",
+      "max_compile_retries": 0,
+      "plan_valid": true,
+      "status": "complete",
+      "status_ok": true,
+      "numeric_ok": true,
+      "missing_numbers": [],
+      "compile_attempts": 1,
+      "compile_retries": 0,
+      "compile_error_history": [],
+      "error_stage": null,
+      "error_type": null,
+      "dag_nodes": 7,
+      "dag_levels": 3,
+      "planning_ms": 6388.001938999878,
+      "compilation_ms": 0.27461199988465523,
+      "execution_ms": 212.60859799986065,
+      "sequential_ms": 474.2055030001211,
+      "joining_ms": 980.1216149999163,
+      "graph_wall_ms": 7583.867094999732,
+      "speedup": 2.23061546858214,
+      "llm_calls": 2,
+      "final_answer": "The Misery Index for Italy is 8.6%, for Spain it is 14.2%, and for Germany it is 5.8%. The percentage change in the Misery Index from Germany (baseline) to Spain (current) is 144.83%."
+    },
+    {
+      "case_id": "h06_partial_multi_tool",
+      "category": "resilience (partial)",
+      "version": "v1 (retries=0)",
+      "max_compile_retries": 0,
+      "plan_valid": false,
+      "status": "failed",
+      "status_ok": false,
+      "numeric_ok": false,
+      "missing_numbers": [
+        128.7
+      ],
+      "compile_attempts": 1,
+      "compile_retries": 0,
+      "compile_error_history": [
+        [
+          "[unknown_argument] (task 'task_5', field 'factor'): Unknown parameter 'factor' for tool 'math_op'."
+        ]
+      ],
+      "error_stage": "compiler",
+      "error_type": "PlanCompilationError",
+      "dag_nodes": 0,
+      "dag_levels": 0,
+      "planning_ms": 4924.271755999143,
+      "compilation_ms": 0.2980110002681613,
+      "execution_ms": null,
+      "sequential_ms": null,
+      "joining_ms": null,
+      "graph_wall_ms": 4926.637407000271,
+      "speedup": null,
+      "llm_calls": 1,
+      "final_answer": null
+    },
+    {
+      "case_id": "h01_deep_nested_fx",
+      "category": "3-level nested path + FX",
+      "version": "v2 (retries=2)",
+      "max_compile_retries": 2,
+      "plan_valid": true,
+      "status": "complete",
+      "status_ok": true,
+      "numeric_ok": true,
+      "missing_numbers": [],
+      "compile_attempts": 2,
+      "compile_retries": 1,
+      "compile_error_history": [
+        [
+          "[invalid_static_argument] (task 'task_4', field 'from_unit'): Invalid static value for parameter 'from_unit' of tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'.",
+          "[invalid_static_argument] (task 'task_4', field 'to_unit'): Invalid static value for parameter 'to_unit' of tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'.",
+          "[invalid_static_argument] (task 'task_5', field 'from_unit'): Invalid static value for parameter 'from_unit' of tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'.",
+          "[invalid_static_argument] (task 'task_5', field 'to_unit'): Invalid static value for parameter 'to_unit' of tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'."
+        ]
+      ],
+      "error_stage": null,
+      "error_type": null,
+      "dag_nodes": 6,
+      "dag_levels": 3,
+      "planning_ms": 10526.06914899934,
+      "compilation_ms": 0.7516830000895425,
+      "execution_ms": 243.03248900014296,
+      "sequential_ms": 475.0332690000505,
+      "joining_ms": 862.7169940000385,
+      "graph_wall_ms": 11637.088718000086,
+      "speedup": 1.954786498188513,
+      "llm_calls": 3,
+      "final_answer": "Germany's nominal GDP is 4163 billion EUR, and Japan's nominal GDP is 3781.2 billion EUR. Germany's GDP is 381.8 billion EUR larger than Japan's."
+    },
+    {
+      "case_id": "h02_co2_per_million",
+      "category": "cross-tool join + pct",
+      "version": "v2 (retries=2)",
+      "max_compile_retries": 2,
+      "plan_valid": true,
+      "status": "complete",
+      "status_ok": true,
+      "numeric_ok": true,
+      "missing_numbers": [],
+      "compile_attempts": 2,
+      "compile_retries": 1,
+      "compile_error_history": [
+        [
+          "[malformed_binding] (task 'task_5', field 'right'): Parameter 'right' looks like a malformed InputBinding (allowed keys: 'task_id', 'output_path'): divided_by: Extra inputs are not permitted.",
+          "[malformed_binding] (task 'task_6', field 'right'): Parameter 'right' looks like a malformed InputBinding (allowed keys: 'task_id', 'output_path'): divided_by: Extra inputs are not permitted."
+        ]
+      ],
+      "error_stage": null,
+      "error_type": null,
+      "dag_nodes": 7,
+      "dag_levels": 3,
+      "planning_ms": 11554.652948999319,
+      "compilation_ms": 0.6627950006077299,
+      "execution_ms": 203.50100399991788,
+      "sequential_ms": 524.9850589998459,
+      "joining_ms": 976.0761679999632,
+      "graph_wall_ms": 12740.628596000533,
+      "speedup": 2.580032332516883,
+      "llm_calls": 3,
+      "final_answer": "Italy's CO2 emissions per million inhabitants are 5.34 megatons, while Germany's are 8.07 megatons. The percentage change from Italy (baseline) to Germany (current) is an increase of 51.16%."
+    },
+    {
+      "case_id": "h03_renewable_twh_groups",
+      "category": "4-country multi-stage",
+      "version": "v2 (retries=2)",
+      "max_compile_retries": 2,
+      "plan_valid": true,
+      "status": "complete",
+      "status_ok": true,
+      "numeric_ok": false,
+      "missing_numbers": [
+        252.75,
+        393.9
+      ],
+      "compile_attempts": 1,
+      "compile_retries": 0,
+      "compile_error_history": [],
+      "error_stage": null,
+      "error_type": null,
+      "dag_nodes": 10,
+      "dag_levels": 3,
+      "planning_ms": 9183.779300999959,
+      "compilation_ms": 0.40680899928702274,
+      "execution_ms": 283.3157149998442,
+      "sequential_ms": 748.5581250002724,
+      "joining_ms": 1307.1841470000436,
+      "graph_wall_ms": 10778.272757000195,
+      "speedup": 2.6423301517540803,
+      "llm_calls": 2,
+      "final_answer": "For Italy, the renewable electricity output is 11,275 TWh. For Spain, it is 14,000 TWh. For Germany, it is 26,520 TWh. For France, it is 12,870 TWh. The combined renewable TWh of Italy and Spain is 25,275 TWh. The combined renewable TWh of Germany and France is 39,390 TWh."
+    },
+    {
+      "case_id": "h04_tax_fx_chain",
+      "category": "FX + country_code enum",
+      "version": "v2 (retries=2)",
+      "max_compile_retries": 2,
+      "plan_valid": false,
+      "status": "failed",
+      "status_ok": false,
+      "numeric_ok": false,
+      "missing_numbers": [
+        184000.0,
+        114080.0,
+        104880.0,
+        9200.0
+      ],
+      "compile_attempts": 3,
+      "compile_retries": 2,
+      "compile_error_history": [
+        [
+          "[invalid_static_argument] (task 'task_2', field 'from_unit'): Invalid static value for tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'.",
+          "[invalid_static_argument] (task 'task_2', field 'to_unit'): Invalid static value for tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'."
+        ],
+        [
+          "[invalid_static_argument] (task 'task_2', field 'from_unit'): Invalid static value for tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'.",
+          "[invalid_static_argument] (task 'task_2', field 'to_unit'): Invalid static value for tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'."
+        ],
+        [
+          "[invalid_static_argument] (task 'task_2', field 'from_unit'): Invalid static value for tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'.",
+          "[invalid_static_argument] (task 'task_2', field 'to_unit'): Invalid static value for tool 'unit_convert': Input should be 'km', 'mi', 'kg' or 'lb'."
+        ]
+      ],
+      "error_stage": "compiler",
+      "error_type": "PlanCompilationError",
+      "dag_nodes": 0,
+      "dag_levels": 0,
+      "planning_ms": 14374.438216999806,
+      "compilation_ms": 1.0332640003980487,
+      "execution_ms": null,
+      "sequential_ms": null,
+      "joining_ms": null,
+      "graph_wall_ms": 14381.068976000279,
+      "speedup": null,
+      "llm_calls": 3,
+      "final_answer": null
+    },
+    {
+      "case_id": "h05_misery_index",
+      "category": "multi-branch + pct",
+      "version": "v2 (retries=2)",
+      "max_compile_retries": 2,
+      "plan_valid": true,
+      "status": "complete",
+      "status_ok": true,
+      "numeric_ok": true,
+      "missing_numbers": [],
+      "compile_attempts": 1,
+      "compile_retries": 0,
+      "compile_error_history": [],
+      "error_stage": null,
+      "error_type": null,
+      "dag_nodes": 7,
+      "dag_levels": 3,
+      "planning_ms": 6476.607320999392,
+      "compilation_ms": 0.3358309995746822,
+      "execution_ms": 213.0956259998129,
+      "sequential_ms": 475.86777200012875,
+      "joining_ms": 861.9655769998644,
+      "graph_wall_ms": 7555.404386999726,
+      "speedup": 2.2333447769318306,
+      "llm_calls": 2,
+      "final_answer": "The Misery Index for Italy is 8.6%, for Spain it is 14.2%, and for Germany it is 5.8%. The percentage change in the Misery Index from Germany (baseline) to Spain (current) is 144.83%."
+    },
+    {
+      "case_id": "h06_partial_multi_tool",
+      "category": "resilience (partial)",
+      "version": "v2 (retries=2)",
+      "max_compile_retries": 2,
+      "plan_valid": true,
+      "status": "partial",
+      "status_ok": true,
+      "numeric_ok": false,
+      "missing_numbers": [
+        128.7
+      ],
+      "compile_attempts": 2,
+      "compile_retries": 1,
+      "compile_error_history": [
+        [
+          "[unknown_argument] (task 'task_5', field 'factor'): Unknown parameter 'factor' for tool 'math_op'."
+        ]
+      ],
+      "error_stage": null,
+      "error_type": null,
+      "dag_nodes": 6,
+      "dag_levels": 2,
+      "planning_ms": 10503.669098999126,
+      "compilation_ms": 0.6908430004841648,
+      "execution_ms": 262.05096499961655,
+      "sequential_ms": 593.6126669994337,
+      "joining_ms": 869.898175000344,
+      "graph_wall_ms": 11642.131208999672,
+      "speedup": 2.2654291726161278,
+      "llm_calls": 3,
+      "final_answer": "France's renewable electricity output is 12,870 TWh. However, the difference in nominal GDP between France and Wakanda could not be calculated because data for Wakanda was not found in the macroeconomic dataset."
+    }
+  ]
+}

@@ -91,6 +91,9 @@ class Planner:
         self,
         request: str,
         available_tools: Mapping[str, str],
+        *,
+        previous_plan: ExecutionPlan | None = None,
+        feedback: str | None = None,
     ) -> list[SystemMessage | HumanMessage]:
         if not request.strip():
             raise ValueError("The user request cannot be empty.")
@@ -107,14 +110,27 @@ class Planner:
             for name, description in available_tools.items()
         )
 
+        sections = [
+            f"AVAILABLE TOOLS:\n{tool_catalog}",
+            f"USER REQUEST:\n{request.strip()}",
+        ]
+
+        normalized_feedback = feedback.strip() if feedback else ""
+        if normalized_feedback:
+            if previous_plan is not None:
+                sections.append(
+                    "PREVIOUS EXECUTION PLAN (FAILED COMPILATION):\n"
+                    f"{previous_plan.model_dump_json(indent=2)}"
+                )
+            sections.append(
+                f"COMPILATION ERRORS TO FIX:\n{normalized_feedback}\n\n"
+                "Fix ONLY the listed compilation errors while preserving the valid "
+                "parts of the plan, and return a corrected ExecutionPlan."
+            )
+
         return [
             SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(
-                content=(
-                    f"AVAILABLE TOOLS:\n{tool_catalog}\n\n"
-                    f"USER REQUEST:\n{request.strip()}"
-                )
-            ),
+            HumanMessage(content="\n\n".join(sections)),
         ]
 
     @staticmethod
@@ -135,9 +151,17 @@ class Planner:
         self,
         request: str,
         available_tools: Mapping[str, str],
+        *,
+        previous_plan: ExecutionPlan | None = None,
+        feedback: str | None = None,
     ) -> ExecutionPlan:
         """Generate a validated ExecutionPlan synchronously."""
-        messages = self._build_messages(request, available_tools)
+        messages = self._build_messages(
+            request,
+            available_tools,
+            previous_plan=previous_plan,
+            feedback=feedback,
+        )
         response = self._structured_llm.invoke(messages)
         return self._extract_plan(response)
 
@@ -145,8 +169,16 @@ class Planner:
         self,
         request: str,
         available_tools: Mapping[str, str],
+        *,
+        previous_plan: ExecutionPlan | None = None,
+        feedback: str | None = None,
     ) -> ExecutionPlan:
         """Generate a validated ExecutionPlan asynchronously."""
-        messages = self._build_messages(request, available_tools)
+        messages = self._build_messages(
+            request,
+            available_tools,
+            previous_plan=previous_plan,
+            feedback=feedback,
+        )
         response = await self._structured_llm.ainvoke(messages)
         return self._extract_plan(response)

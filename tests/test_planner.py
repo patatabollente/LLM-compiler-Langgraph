@@ -132,3 +132,31 @@ def test_planner_raises_output_error_preserving_raw_output():
         planner.plan("Richiesta test", {"calculator": "desc"})
 
     assert exc_info.value.raw_output == raw_payload
+
+
+def test_planner_includes_previous_plan_and_feedback_on_retry():
+    expected = _sample_plan()
+    fake_llm = FakeChatModel({"parsed": expected, "parsing_error": None, "raw": "{}"})
+    planner = Planner(llm=fake_llm)  # type: ignore[arg-type]
+
+    # Blank feedback must not inject correction sections.
+    planner.plan("Calcola", {"calculator": "desc"}, previous_plan=expected, feedback="   ")
+    first_prompt = fake_llm.runnable.received_messages[1].content
+    assert "COMPILATION ERRORS TO FIX:" not in first_prompt
+    assert "PREVIOUS EXECUTION PLAN" not in first_prompt
+
+    # Real feedback + previous_plan must inject both sections cleanly.
+    feedback = "- [malformed_binding] (task 'task_3', field 'b'): extra key 'output, path'"
+    asyncio.run(
+        planner.aplan(
+            "Calcola",
+            {"calculator": "desc"},
+            previous_plan=expected,
+            feedback=feedback,
+        )
+    )
+    retry_prompt = fake_llm.runnable.received_messages[1].content
+    assert "PREVIOUS EXECUTION PLAN (FAILED COMPILATION):" in retry_prompt
+    assert '"task_id": "task_3"' in retry_prompt
+    assert "COMPILATION ERRORS TO FIX:" in retry_prompt
+    assert "malformed_binding" in retry_prompt
