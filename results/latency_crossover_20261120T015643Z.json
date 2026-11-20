@@ -1,0 +1,88 @@
+{
+  "benchmark": "io_latency_crossover_compiler_vs_react",
+  "timestamp_utc": "20261120T015643Z",
+  "model": "qwen3:8b",
+  "reasoning": false,
+  "num_predict": 2048,
+  "slow_hops_s": [
+    0.5,
+    2.0,
+    4.0,
+    6.0,
+    8.0
+  ],
+  "crossover_slow_hop_s": 3.53,
+  "crossover_wall_s": 13.56,
+  "points": [
+    {
+      "slow_hop_s": 0.5,
+      "compiler_wall_s": 9.407,
+      "compiler_io_s": 0.778,
+      "compiler_llm_calls": 2,
+      "compiler_tokens": 3265,
+      "compiler_exact": true,
+      "react_wall_s": 6.042,
+      "react_llm_calls": 5,
+      "react_tokens": 4253,
+      "react_exact": true,
+      "delta_s": 3.365,
+      "delta_pct": 55.7
+    },
+    {
+      "slow_hop_s": 2.0,
+      "compiler_wall_s": 11.219,
+      "compiler_io_s": 3.106,
+      "compiler_llm_calls": 2,
+      "compiler_tokens": 3193,
+      "compiler_exact": true,
+      "react_wall_s": 10.258,
+      "react_llm_calls": 5,
+      "react_tokens": 4253,
+      "react_exact": true,
+      "delta_s": 0.961,
+      "delta_pct": 9.4
+    },
+    {
+      "slow_hop_s": 4.0,
+      "compiler_wall_s": 14.268,
+      "compiler_io_s": 6.208,
+      "compiler_llm_calls": 2,
+      "compiler_tokens": 3193,
+      "compiler_exact": true,
+      "react_wall_s": 14.561,
+      "react_llm_calls": 5,
+      "react_tokens": 4253,
+      "react_exact": true,
+      "delta_s": -0.293,
+      "delta_pct": -2.0
+    },
+    {
+      "slow_hop_s": 6.0,
+      "compiler_wall_s": 17.239,
+      "compiler_io_s": 9.309,
+      "compiler_llm_calls": 2,
+      "compiler_tokens": 3193,
+      "compiler_exact": true,
+      "react_wall_s": 19.494,
+      "react_llm_calls": 5,
+      "react_tokens": 4253,
+      "react_exact": true,
+      "delta_s": -2.255,
+      "delta_pct": -11.6
+    },
+    {
+      "slow_hop_s": 8.0,
+      "compiler_wall_s": 20.783,
+      "compiler_io_s": 12.411,
+      "compiler_llm_calls": 2,
+      "compiler_tokens": 3193,
+      "compiler_exact": true,
+      "react_wall_s": 24.586,
+      "react_llm_calls": 5,
+      "react_tokens": 4253,
+      "react_exact": true,
+      "delta_s": -3.804,
+      "delta_pct": -15.5
+    }
+  ]
+}
