@@ -6,12 +6,16 @@ from pydantic import ValidationError
 
 from langgraph_llm_compiler.executor import ExecutionResult, TaskExecutionResult
 from langgraph_llm_compiler.joiner import (
+    REPLAN_SYSTEM_PROMPT,
+    ExecutionRound,
     Joiner,
+    JoinerDecisionOutput,
     JoinerOutput,
     JoinerOutputError,
     JoinerResult,
     classify_execution_status,
     extract_missing_information,
+    format_replan_context,
 )
 from langgraph_llm_compiler.planner import ExecutionPlan, InputBinding, TaskSpec
 
@@ -416,3 +420,125 @@ def test_joiner_models_are_frozen_and_forbid_extra_fields():
 
     with pytest.raises(ValidationError):
         JoinerResult(answer="ok", status="complete", unknown=True)  # type: ignore[call-arg]
+
+
+def test_joiner_decision_output_validation_and_empty_normalization():
+    fin = JoinerDecisionOutput(action="finish", answer="  Fatto! ", replan_reason="   ")
+    assert fin.action == "finish"
+    assert fin.answer == "Fatto!"
+    assert fin.replan_reason is None
+
+    rep = JoinerDecisionOutput(
+        action="replan", answer="", replan_reason="Use backup_fx_api instead."
+    )
+    assert rep.action == "replan"
+    assert rep.answer is None
+    assert rep.replan_reason == "Use backup_fx_api instead."
+
+    with pytest.raises(ValidationError):
+        JoinerDecisionOutput(action="finish", answer=None)
+
+    with pytest.raises(ValidationError):
+        JoinerDecisionOutput(action="replan", replan_reason="   ")
+
+
+def test_joiner_v3_replan_action_and_catalog_prompt():
+    fake_llm = FakeChatModel(
+        {
+            "parsed": JoinerDecisionOutput(
+                action="replan",
+                answer="ignored filler",
+                replan_reason="primary lookup failed; call backup_lookup for Italy.",
+            ),
+            "parsing_error": None,
+            "raw": "{}",
+        }
+    )
+    joiner = Joiner(llm=fake_llm)  # type: ignore[arg-type]
+
+    result = asyncio.run(
+        joiner.join(
+            request="Differenza popolazione Italia meno Francia",
+            execution_result=_partial_execution_result(),
+            plan=_sample_plan(),
+            tool_catalog={
+                "population_lookup": "Primary lookup.",
+                "backup_lookup": "Backup lookup.",
+            },
+            allow_replan=True,
+        )
+    )
+
+    assert fake_llm.structured_output_kwargs["schema"] is JoinerDecisionOutput
+    assert result.action == "replan"
+    assert result.answer is None
+    assert result.replan_reason == "primary lookup failed; call backup_lookup for Italy."
+    assert result.status == "partial"
+
+    system_msg, human_msg = fake_llm.runnable.received_messages
+    assert system_msg.content == REPLAN_SYSTEM_PROMPT
+    assert "AVAILABLE TOOLS:" in human_msg.content
+    assert "backup_lookup: Backup lookup." in human_msg.content
+
+
+def test_classify_execution_status_across_prior_rounds():
+    prior_partial = ExecutionRound(
+        round_index=1,
+        plan=_sample_plan(),
+        execution_result=_partial_execution_result(),
+        replan_reason="Retry missing Italy with backup.",
+    )
+    all_failed_round2 = ExecutionResult(
+        objective="Backup attempt",
+        total_duration_ms=20.0,
+        max_concurrency=8,
+        results={
+            "task_1": TaskExecutionResult(
+                task_id="task_1",
+                tool_name="backup_lookup",
+                status="error",
+                error="Also down",
+                error_type="RuntimeError",
+                error_stage="tool_execution",
+                duration_ms=20.0,
+                started_at_ms=0.0,
+                finished_at_ms=20.0,
+            )
+        },
+    )
+    all_succeeded_round2 = ExecutionResult(
+        objective="Backup attempt",
+        total_duration_ms=20.0,
+        max_concurrency=8,
+        results={
+            "task_1": TaskExecutionResult(
+                task_id="task_1",
+                tool_name="backup_lookup",
+                status="success",
+                output={"country": "Italy", "population": 58_990_000},
+                duration_ms=20.0,
+                started_at_ms=0.0,
+                finished_at_ms=20.0,
+            )
+        },
+    )
+
+    assert classify_execution_status(all_succeeded_round2, [prior_partial]) == "complete"
+    assert classify_execution_status(all_failed_round2, [prior_partial]) == "partial"
+    assert classify_execution_status(all_failed_round2, ()) == "failed"
+
+
+def test_format_replan_context_includes_succeeded_and_failed_details():
+    prior_round = ExecutionRound(
+        round_index=1,
+        plan=_sample_plan(),
+        execution_result=_partial_execution_result(),
+        replan_reason="Use backup tool for Italy.",
+    )
+    ctx = format_replan_context([prior_round], "Use backup tool for Italy.")
+    assert "JOINER REPLAN GUIDANCE:" in ctx
+    assert "Use backup tool for Italy." in ctx
+    assert "ROUND 1:" in ctx
+    assert "68400000" in ctx
+    assert "Upstream service unavailable" in ctx
+

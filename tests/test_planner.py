@@ -160,3 +160,39 @@ def test_planner_includes_previous_plan_and_feedback_on_retry():
     assert '"task_id": "task_3"' in retry_prompt
     assert "COMPILATION ERRORS TO FIX:" in retry_prompt
     assert "malformed_binding" in retry_prompt
+
+
+def test_planner_supports_replan_context_and_compile_feedback_together():
+    expected = ExecutionPlan(
+        objective="Follow-up calculation",
+        tasks=[
+            TaskSpec(
+                task_id="task_1",
+                tool_name="backup_lookup",
+                description="Fetch Italy from backup.",
+                inputs={"country": "Italy"},
+            )
+        ],
+    )
+    fake_llm = FakeChatModel({"parsed": expected, "parsing_error": None, "raw": "{}"})
+    planner = Planner(llm=fake_llm)  # type: ignore[arg-type]
+
+    replan_ctx = "JOINER REPLAN GUIDANCE:\nUse backup_lookup for Italy."
+    compile_fb = "- [unknown_argument] (task 'task_1', field 'name'): Unknown parameter."
+
+    asyncio.run(
+        planner.aplan(
+            "Calcola Italia meno Francia",
+            {"backup_lookup": "Backup stats lookup."},
+            previous_plan=expected,
+            feedback=compile_fb,
+            replan_context=replan_ctx,
+        )
+    )
+    prompt = fake_llm.runnable.received_messages[1].content
+    assert "RUNTIME REPLANNING CONTEXT (PREVIOUS ROUNDS):" in prompt
+    assert "Use backup_lookup for Italy." in prompt
+    assert "PREVIOUS EXECUTION PLAN (FAILED COMPILATION):" in prompt
+    assert "COMPILATION ERRORS TO FIX:" in prompt
+    assert "unknown_argument" in prompt
+

@@ -22,8 +22,8 @@ Il progetto è progettato con tre obiettivi primari: **correttezza formale** (co
    - [3.3 Validazione sintattica (Pydantic) vs semantica (`PlanCompiler`) e algoritmo di Kahn](#33-validazione-sintattica-pydantic-vs-semantica-plancompiler-e-algoritmo-di-kahn)
    - [3.4 Scheduler `asyncio` event-driven vs LangGraph `StateGraph` dinamico (Pregel BSP)](#34-scheduler-asyncio-event-driven-vs-langgraph-stategraph-dinamico-pregel-bsp)
    - [3.5 Esecuzione best-effort, propagazione `SKIPPED` e telemetria serializzabile](#35-esecuzione-best-effort-propagazione-skipped-e-telemetria-serializzabile)
-   - [3.6 Separazione deterministica nel `Joiner` (`JoinerOutput` vs `JoinerResult`)](#36-separazione-deterministica-nel-joiner-joineroutput-vs-joinerresult)
-   - [3.7 Orchestrazione macro con LangGraph: da v1 lineare a v2 compile-time self-correction](#37-orchestrazione-macro-con-langgraph-da-v1-lineare-a-v2-compile-time-self-correction)
+   - [3.6 Separazione deterministica nel `Joiner` (`JoinerOutput` / `JoinerDecisionOutput` vs `JoinerResult`)](#36-separazione-deterministica-nel-joiner-joineroutput--joinerdecisionoutput-vs-joinerresult)
+   - [3.7 Orchestrazione macro con LangGraph: v1 lineare, v2 compile-time self-correction e v3 runtime replanning](#37-orchestrazione-macro-con-langgraph-v1-lineare-v2-compile-time-self-correction-e-v3-runtime-replanning)
    - [3.8 Rigore metodologico delle metriche](#38-rigore-metodologico-delle-metriche)
 4. [Risultati sperimentali e analisi critica](#4-risultati-sperimentali-e-analisi-critica)
    - [4.1 Overhead puro di orchestrazione LangGraph](#41-overhead-puro-di-orchestrazione-langgraph)
@@ -31,6 +31,7 @@ Il progetto è progettato con tre obiettivi primari: **correttezza formale** (co
    - [4.3 Benchmark deterministico di scheduling (Event-driven vs Pregel BSP)](#43-benchmark-deterministico-di-scheduling-event-driven-vs-pregel-bsp)
    - [4.4 Hard Suite 10 tool: matrice 2x2 (v1 vs v2 e reasoning)](#44-hard-suite-10-tool-matrice-2x2-v1-vs-v2-e-reasoning)
    - [4.5 Cosa cambia con i retry (v2): vantaggi, svantaggi e guida alla scelta](#45-cosa-cambia-con-i-retry-v2-vantaggi-svantaggi-e-guida-alla-scelta)
+   - [4.6 Runtime Replanning (v2 vs v3): fallback, alias, scoperta 2-stage e controllo anti-spreco](#46-runtime-replanning-v2-vs-v3-fallback-alias-scoperta-2-stage-e-controllo-anti-spreco)
 5. [Struttura del repository](#5-struttura-del-repository)
 6. [Setup, verifica e comandi per gli esperimenti](#6-setup-verifica-e-comandi-per-gli-esperimenti)
 7. [Roadmap](#7-roadmap)
@@ -84,7 +85,7 @@ flowchart LR
     R -->|handler + schemi| E
     E -->|ExecutionResult| J["Joiner (LLM + stato deterministico)"]
     C -. "v2: CompilationIssue + previous_plan" .-> P
-    J -. "v3 roadmap: replan + risultati parziali" .-> P
+    J -. "v3: replan_context + execution_history" .-> P
 ```
 
 ### Riepilogo dei moduli
@@ -92,11 +93,11 @@ flowchart LR
 | Modulo | File principali | Usa LLM? | Stato | Responsabilità unica |
 | :--- | :--- | :---: | :---: | :--- |
 | `ToolRegistry` (`compiler/registry.py`) | `registry.py` | No | Implementato | Custodisce i `ToolSpec` (funzioni + schemi Pydantic I/O) e genera il catalogo per il Planner. |
-| `planner` | `schemas.py`, `planner.py` | **Sì** | Implementato (v2) | Trasforma la richiesta testuale (e l'eventuale feedback di retry) in un `ExecutionPlan` sintatticamente valido. |
+| `planner` | `schemas.py`, `planner.py` | **Sì** | Implementato (v3) | Trasforma la richiesta testuale (con eventuale `feedback` v2 e/o `replan_context` v3) in un `ExecutionPlan` sintatticamente valido. |
 | `compiler` | `dag.py`, `compiler.py` | No | Implementato | Verifica staticamente tutte le regole semantiche del piano e produce un `CompiledDAG` immutabile (o tutte le `CompilationIssue`). |
 | `executor` | `results.py`, `bindings.py`, `executor.py` | No | Implementato | Esegue il `CompiledDAG` in parallelo con scheduler `asyncio` event-driven e produce `ExecutionResult`. |
-| `joiner` | `schemas.py`, `joiner.py` | **Sì** + codice | Implementato (v1) | Sintetizza `answer` (LLM) e calcola deterministicamente `status` e `missing_information` (`JoinerResult`). |
-| `graph` | `state.py`, `nodes.py`, `builder.py` | No (orchestrazione) | Implementato (v2) | Collega i moduli in uno `StateGraph` LangGraph, gestisce errori, metriche e il ciclo di retry v2 `compiler -> planner`. |
+| `joiner` | `schemas.py`, `joiner.py` | **Sì** + codice | Implementato (v3) | Sintetizza `answer` (`finish`) oppure chiede un follow-up (`replan` con `replan_reason`), calcolando deterministicamente `status` e `missing_information` (`JoinerResult`). |
+| `graph` | `state.py`, `nodes.py`, `builder.py` | No (orchestrazione) | Implementato (v3) | Collega i moduli in uno `StateGraph` LangGraph con compile retry v2 (`compiler -> planner`), runtime replan v3 (`joiner -> planner`) e degradazione controllata. |
 
 ---
 
@@ -297,10 +298,10 @@ Il `Joiner` (`joiner/joiner.py`) trasforma i dati tecnici grezzi dell'`Executor`
 * **Garanzie offerte a valle:**
   * `status` e `missing_information` sono **matematicamente coerenti** con `ExecutionResult` (non dipendono mai dall'umore dell'LLM);
   * `answer` è una stringa non vuota formattata per l'utente finale.
-* **Fine della responsabilità:** il `Joiner` (in v1) **non ritenta** l'esecuzione e **non modifica** il piano: il suo lavoro termina consegnando la risposta strutturata e completa.
+* **Fine della responsabilità:** quando `allow_replan=False` (o su errori irrecuperabili come `"Atlantis"`), il `Joiner` termina con `action="finish"` consegnando la risposta finale. Quando `allow_replan=True` e rileva un errore recuperabile (es. un tool di backup disponibile) o uno stadio di scoperta incompleto, restituisce `action="replan"` con `replan_reason` — senza mai modificare direttamente il piano né invocare tool: passa il testimone al coordinatore (`graph`) per un nuovo giro al `Planner`.
 
 > **In parole semplici:**
-> Il `Joiner` è il portavoce: legge il registro tecnico del cantiere e scrive un messaggio chiaro, educato e onesto nella tua lingua, senza annoiarti con codici interni tipo `task_3`. Allo stesso tempo, il timbro ufficiale *"completo / parziale / fallito"* e la lista esatta di cosa è mancato vengono stampati in automatico dal computer, così non possono mai esserci imprecisioni.
+> Il `Joiner` è il portavoce (e in v3 anche il revisore finale): legge il registro tecnico del cantiere e, se manca un pezzo che si può davvero recuperare con un attrezzo di riserva, chiede un giro extra mirato; se invece tutto è pronto o un pezzo è davvero irrecuperabile (come Atlantide), scrive subito un messaggio chiaro, educato e onesto nella tua lingua, con il timbro ufficiale *"completo / parziale / fallito"* calcolato automaticamente dal computer.
 
 ---
 
@@ -309,16 +310,18 @@ Il `Joiner` (`joiner/joiner.py`) trasforma i dati tecnici grezzi dell'`Executor`
 Infine, il modulo `graph` (`graph/state.py`, `graph/nodes.py`, `graph/builder.py`) **non re-implementa nessuna logica** dei moduli precedenti: li avvolge in 4 nodi sottili dentro uno `StateGraph` di LangGraph.
 
 * **Input:** lo stato iniziale `{"request": "..."}` passato a `await graph.ainvoke(...)` o `graph.astream(...)`.
-* **Cosa fa:** gestisce il passaggio di stato (`CompilerState`) da un modulo all'altro, cronometra ogni fase in `WorkflowMetrics`, intercetta eventuali errori applicativi in `WorkflowError` e — in **v2** (`max_compile_retries > 0`) — gestisce il ciclo condizionale `compiler -> planner` quando il `PlanCompiler` boccia un piano.
+* **Cosa fa:** gestisce il passaggio di stato (`CompilerState`) da un modulo all'altro, cronometra ogni fase in `WorkflowMetrics`, intercetta eventuali errori applicativi in `WorkflowError` e governa entrambi i cicli di controllo:
+  * **v2 (`max_compile_retries > 0`)**: ciclo `compiler -> planner` quando `PlanCompiler` boccia un piano;
+  * **v3 (`max_replans > 0`)**: ciclo `joiner -> planner` quando `Joiner` chiede un replan runtime, archiviando ogni round in `execution_history` e applicando *Graceful Degradation* se un round di replan fallisce prima dell'esecuzione.
 * **Output:** lo stato finale `CompilerState` completo di:
-  * `plan`, `compiled_dag`, `execution_result`, `joiner_result`, `final_answer`, `status`;
-  * `error` (eventuale `WorkflowError`), `compile_error_history`;
-  * `metrics` (`planning_latency_ms`, `compilation_latency_ms`, `execution_latency_ms`, `joining_latency_ms`, `llm_calls`, `compile_attempts`, `compile_retries`, `plan_valid`, `component_latency_ms`).
+  * `plan`, `compiled_dag`, `execution_result`, `execution_history`, `joiner_result`, `final_answer`, `status`;
+  * `error` (eventuale `WorkflowError` fatale), `replan_error` (eventuale guasto non fatale di un round di replan recuperato via fallback), `compile_error_history`;
+  * `metrics` (`planning_latency_ms`, `compilation_latency_ms`, `execution_latency_ms`, `joining_latency_ms`, `llm_calls`, `compile_attempts`, `compile_retries`, `replan_attempts`, `plan_valid`, `component_latency_ms`).
 * **Garanzie offerte a valle:**
-  * Terminazione garantita (grazie al budget `max_compile_retries`), osservabilità step-by-step via `astream`, e separazione netta tra logica dei componenti e orchestrazione del flusso.
+  * Terminazione garantita (grazie ai budget separati `max_compile_retries` per round e `max_replans` globale), proprietà di sicurezza monotonica (un replan fallito non distrugge mai risultati già ottenuti al Round 1), osservabilità step-by-step via `astream`, e separazione netta tra logica dei componenti e orchestrazione del flusso.
 
 > **In parole semplici:**
-> Il modulo `graph` è il **nastro trasportatore intelligente** (con un supervisore) che collega le postazioni di lavoro descritte sopra: prende la scatola prodotta da un reparto, cronometra quanto ci ha messo, la passa al reparto successivo e — se l'ispettore (`PlanCompiler`) rimanda indietro il foglio perché c'è un errore — lo riporta automaticamente al `Planner` per una seconda passata, tenendo il conto dei tentativi. Se un giorno vuoi sostituire LangGraph con un altro orchestratore, tutti i moduli sotto (`ToolRegistry`, `Planner`, `PlanCompiler`, `Executor`, `Joiner`) continuano a funzionare esattamente allo stesso modo senza cambiare una riga.
+> Il modulo `graph` è il **nastro trasportatore intelligente** (con un supervisore) che collega le postazioni di lavoro descritte sopra: prende la scatola prodotta da un reparto, cronometra quanto ci ha messo, la passa al reparto successivo e gestisce sia i ritorni dell'ispettore (`PlanCompiler` → `Planner`, v2) sia i giri extra richiesti dal portavoce dopo aver visto i risultati reali (`Joiner` → `Planner`, v3). Se un giro extra dovesse andare storto, il supervisore non butta mai via il lavoro buono già fatto al primo giro. E se un giorno vuoi sostituire LangGraph con un altro orchestratore, tutti i moduli sotto (`ToolRegistry`, `Planner`, `PlanCompiler`, `Executor`, `Joiner`) continuano a funzionare esattamente allo stesso modo senza cambiare una riga.
 
 ---
 
@@ -490,28 +493,31 @@ In `src/langgraph_llm_compiler/executor/results.py` e `executor.py`, ogni task p
 
 ---
 
-### 3.6 Separazione deterministica nel `Joiner` (`JoinerOutput` vs `JoinerResult`)
+### 3.6 Separazione deterministica nel `Joiner` (`JoinerOutput` / `JoinerDecisionOutput` vs `JoinerResult`)
 
-In `src/langgraph_llm_compiler/joiner/`, separiamo nettamente ciò che è **generativo** da ciò che è **deterministico**:
+In `src/langgraph_llm_compiler/joiner/`, separiamo nettamente ciò che è **generativo** da ciò che è **deterministico**, usando un **doppio schema adattivo** per garantire zero overhead quando il replanning non è attivo:
 
-* **Responsabilità dell'LLM (`JoinerOutput`)**: genera *unicamente* il campo testuale `answer: str` seguendo 4 regole esplicite di sistema:
+* **Modalità sintesi (`allow_replan=False`, v1/v2 o ultimo giro del budget v3)**: l'LLM usa lo schema leggero `JoinerOutput(answer)` e genera *unicamente* il testo finale seguendo 4 regole:
   1. **Lingua**: rispondere nella stessa lingua della richiesta utente originale.
-  2. **Grounding stretto**: riportare solo fatti e numeri presenti negli output `success`; mai inventare o stimare risultati mancanti.
+  2. **Grounding stretto**: riportare solo fatti e numeri presenti negli output `success` (su tutti i round eseguiti); mai inventare o stimare risultati mancanti.
   3. **Trasparenza**: esplicitare chiaramente quali parti non sono state completate e perché.
   4. **Stile user-friendly**: non esporre mai identificativi interni (`task_1`, `task_4`) né nomi grezzi di funzioni/tool nella risposta finale.
+* **Modalità decisionale (`allow_replan=True`, v3 con budget residuo)**: l'LLM usa `JoinerDecisionOutput(action, answer, replan_reason)` (con binding lazy e normalizzazione automatica `"" -> None` contro le stringhe vuote tipiche dei modelli 8B) e riceve anche il `tool_catalog` ufficiale (`AVAILABLE TOOLS`) per prendere una decisione informata:
+  * **`"replan"`**: scelto *solo* se (a) un errore runtime può essere recuperato tramite un tool alternativo nel catalogo o argomenti corretti, oppure (b) i task del Round 1 hanno scoperto dati intermedi necessari a lanciare il Round 2.
+  * **`"finish"`**: scelto immediatamente se la richiesta è già soddisfatta oppure se l'errore è irrecuperabile (es. `"Atlantis"` non esiste in alcun tool), evitando replan sprecati.
 * **Responsabilità del codice deterministico (`JoinerResult`)**:
-  * `classify_execution_status(execution_result)` calcola `status`:
-    * `"complete"` se tutti i task sono `success`;
-    * `"failed"` se zero task sono `success`;
-    * `"partial"` in tutti i casi misti.
-  * `extract_missing_information(execution_result, plan)` costruisce l'elenco ordinato topologicamente dei task falliti o saltati, usando la descrizione leggibile `task.description` (con fallback a `tool_name`) e il motivo strutturato.
+  * `classify_execution_status(execution_result, prior_rounds)` calcola `status`:
+    * `"complete"` se tutti i task dell'ultimo round sono `success`;
+    * `"partial"` se l'ultimo round ha errori/skip ma almeno un task è riuscito in *qualsiasi* round;
+    * `"failed"` se zero task sono riusciti su tutti i round.
+  * `extract_missing_information(execution_result, plan)` costruisce l'elenco ordinato topologicamente dei task falliti o saltati, usando `task.description` (con fallback a `tool_name`).
 
 > **In parole semplici:**
-> All'intelligenza artificiale chiediamo solo quello che sa fare meglio: scrivere un testo chiaro, naturale e ben scritto nella tua lingua. Ma il "semaforo" che dice se il lavoro è **completo**, **parziale** o **fallito** — e la lista ufficiale di cosa è mancato — li calcola il programma con regole matematiche rigide. In questo modo il modello non può mai "fare il furbo" dichiarando *tutto ok!* quando in realtà un pezzo si è rotto.
+> All'intelligenza artificiale chiediamo solo ciò che sa fare bene: scrivere una risposta chiara nella tua lingua e, in v3, guardare l'elenco degli attrezzi disponibili per capire se vale la pena fare un secondo tentativo con uno strumento di riserva (invece di accanirsi inutilmente su qualcosa che non esiste). Il "semaforo" ufficiale (`complete` / `partial` / `failed`) e la lista esatta delle informazioni mancanti restano però sempre calcolati dal codice con matematica rigida, così il modello non può mai mentire sullo stato del lavoro.
 
 ---
 
-### 3.7 Orchestrazione macro con LangGraph: da v1 lineare a v2 compile-time self-correction
+### 3.7 Orchestrazione macro con LangGraph: v1 lineare, v2 compile-time self-correction e v3 runtime replanning
 
 LangGraph viene usato **esclusivamente al livello di orchestrazione macro stateful** (`src/langgraph_llm_compiler/graph/`), dove brillano i suoi punti di forza: gestione pulita dei cicli di controllo tramite conditional edges, stato condiviso tipizzato (`CompilerState`), streaming passo-passo (`astream`) e interfaccia uniforme per confrontare la nostra architettura con altri agenti (es. ReAct).
 
@@ -519,30 +525,36 @@ LangGraph viene usato **esclusivamente al livello di orchestrazione macro statef
 flowchart TD
     START(["START"]) --> P["planner"]
     P -->|"ExecutionPlan OK"| C["compiler"]
-    P -->|"PlannerOutputError"| END_ERR(["END (failed)"])
+    P -->|"Errore (Round 1)"| END_ERR(["END (failed)"])
+    P -. "v3: errore Round 2+ (Graceful Degradation)" .-> J["joiner"]
     C -->|"CompiledDAG OK"| E["executor"]
-    C -->|"PlanCompilationError & retries < budget (v2)"| P
-    C -->|"PlanCompilationError & budget esaurito"| END_ERR
-    E -->|"ExecutionResult OK"| J["joiner"]
-    E -->|"Errore infrastrutturale"| END_ERR
-    J --> END_OK(["END (complete / partial / failed)"])
+    C -->|"v2: PlanCompilationError & round_attempts <= max"| P
+    C -->|"Budget compile esaurito (Round 1)"| END_ERR
+    C -. "v3: budget compile esaurito Round 2+ (Graceful Degradation)" .-> J
+    E -->|"ExecutionResult OK"| J
+    E -->|"Errore infrastrutturale (Round 1)"| END_ERR
+    J -->|"action == 'finish' (o budget replan esaurito)"| END_OK(["END (complete / partial / failed)"])
+    J -. "v3: action == 'replan' & replan_attempts < max" .-> P
 ```
 
 Dettagli chiave dell'implementazione in `graph/state.py`, `graph/nodes.py` e `graph/builder.py`:
 
-* **4 nodi async sottili (`nodes.py`)**: ciascun nodo wrappa il proprio componente core (`Planner`, `PlanCompiler`, `Executor`, `Joiner`) misurandone la latenza via `time.perf_counter()`, aggiornando `WorkflowMetrics` e intercettando eccezioni applicative in `WorkflowError` (preservando però esplicitamente `asyncio.CancelledError` affinché la cancellazione di task asincroni non venga mai inghiottita).
-* **Retrocompatibilità v1 → v2**: `build_compiler_graph(..., max_compile_retries: int = 0)` mantiene di default `0` (comportamento v1 puramente lineare). Impostando `max_compile_retries > 0` (es. `2`), il grafo abilita il ciclo `compiler -> planner`:
-  1. Al fallimento di `PlanCompiler`, il nodo compiler formatta tutte le `CompilationIssue` in `compile_feedback` e aggiunge l'elenco dei messaggi a `compile_error_history`.
-  2. Il router condizionale verifica se `compile_retries < max_compile_retries` (`compile_retries = max(0, compile_attempts - 1)`). Se c'è ancora budget, instrada verso `planner`.
-  3. Il nodo `planner` rileva `compile_feedback` e richiama `planner.aplan(request, previous_plan=..., feedback=...)`, chiedendo all'LLM una riparazione mirata del piano precedente.
-  4. Le latenze `planning_latency_ms` e `compilation_latency_ms` sono **cumulative** su tutti i tentativi, e `llm_calls` conta ogni chiamata reale.
-  5. `metrics.plan_valid` è **tri-stato**: `None` se fallisce il Planner prima della compilazione, `False` se il Compiler boccia il piano, `True` non appena il piano compila.
+* **4 nodi async sottili (`nodes.py`)**: ciascun nodo wrappa il proprio componente core (`Planner`, `PlanCompiler`, `Executor`, `Joiner`) misurandone la latenza cumulativa via `time.perf_counter()`, aggiornando `WorkflowMetrics` e intercettando eccezioni applicative in `WorkflowError` (preservando però esplicitamente `asyncio.CancelledError`).
+* **Progressione retrocompatibile `v1 -> v2 -> v3`**: `build_compiler_graph(..., max_compile_retries: int = 0, max_replans: int = 0)` espone solo gli archi necessari:
+  * **`v1` (`0, 0`)**: grafo puramente lineare con uscite anticipate su errore.
+  * **`v2` (`max_compile_retries > 0`)**: abilita il ciclo `compiler -> planner` su `PlanCompilationError`, passando `previous_plan` + `compile_feedback` e accumulando `compile_error_history`.
+  * **`v3` (`max_replans > 0`)**: abilita il ciclo **Context-Injected Replanning** `joiner -> planner`:
+    1. Prima di ripartire, il nodo `joiner` archivia il round concluso in `execution_history: list[ExecutionRound]` e costruisce `replan_context` tramite `format_replan_context(...)`, elencando risultati già ottenuti (come valori letterali, **omettendo deliberatamente i vecchi `task_id`** per impedire all'LLM di creare `InputBinding` rotti verso round precedenti) e chiamate fallite da non ripetere.
+    2. `PlanCompiler` ed `Executor` restano **invariati al 100%**: validano ed eseguono un normale `CompiledDAG` pulito per i soli passi mancanti o di fallback.
+    3. **Budget indipendenti e coesistenza v2 + v3**: ogni replan azzera `round_compile_attempts` (così il Round 2 ha un budget pieno di compile retry, mentre `metrics.compile_attempts` e `metrics.compile_retries` tengono i totali globali esatti); se il Round 2 sbaglia a compilare, il `Planner` riceve **sia** `replan_context` **sia** `previous_plan` + `compile_feedback`.
+    4. **Graceful Degradation (proprietà di sicurezza monotonica)**: se un round di replan fallisce al `planner`, al `compiler` (budget esaurito) o all'`executor`, il router **non distrugge** i risultati già raccolti nel Round 1: devia sul `joiner` in modalità `allow_replan=False` sull'ultimo round riuscito in `execution_history`, consegnando comunque la miglior risposta parziale e registrando il guasto di replan in `replan_error` (lasciando `error = None`).
 * **Nessun parametro fittizio (`checkpointer`)**: `build_compiler_graph` non espone ancora un parametro `checkpointer` perché la serializzazione di `CompiledDAG` (che usa `MappingProxyType`) tramite `MemorySaver`/`SqliteSaver` non è stata ancora testata formalmente; verrà introdotto solo insieme ai relativi test di persistenza.
 
 > **In parole semplici:**
-> LangGraph è il **direttore d'orchestra** che sta sopra ai quattro reparti. Tiene un quaderno condiviso dove sono annotati la richiesta, il piano, gli eventuali errori e i tempi cronometrati di ogni reparto.
-> * Nella **versione 1**, se l'Ispettore (Compiler) trovava anche un solo errore nel piano, il direttore fermava subito tutto e dichiarava fallimento.
-> * Nella **versione 2**, il direttore prende il foglio con le correzioni in rosso dell'Ispettore e lo rimanda al Pianificatore dicendo: *"Questo era il tuo piano, ecco esattamente cosa non va, riprova!"*. Per sicurezza imposta un limite massimo di tentativi (es. 2 retry), così se il modello si incarta il sistema si ferma comunque in modo pulito e conserva tutta la storia degli errori per farci capire cosa è successo.
+> LangGraph è il **direttore d'orchestra** che coordina i quattro reparti tenendo un quaderno di stato condiviso:
+> * Nella **versione 1**, se qualcosa va storto lo spettacolo si ferma subito.
+> * Nella **versione 2**, se l'Ispettore (`PlanCompiler`) trova errori *prima* di partire, rimanda la bozza al Pianificatore fino a 2 volte per farla correggere gratis prima di chiamare qualsiasi strumento.
+> * Nella **versione 3**, anche *dopo* che la squadra ha lavorato sul campo, se uno strumento era rotto (e ce n'è uno di riserva) oppure se al primo giro abbiamo scoperto un elenco di nomi su cui bisogna ora lavorare, il direttore salva il lavoro buono già fatto, mostra al Pianificatore i numeri già trovati e lancia un **secondo giro mirato** solo per ciò che manca. E se per caso il secondo giro va storto, il direttore ha una rete di sicurezza: non butta mai via i risultati buoni del primo giro!
 
 ---
 
@@ -671,11 +683,46 @@ Poiché la suite da 4 tool era saturata al 100%, per misurare l'impatto reale de
 | Catalogo ampio e formule complesse, priorità a **massima accuratezza** | `v2 (retries=2)` + `reasoning=True` *(con limite `num_predict`/timeout)* | 100% di piani validi e 100% di accuratezza numerica (6/6), proteggendo la tail latency con un cap sui token di pensiero. |
 
 > **In parole semplici:**
-> Ecco cosa ci hanno insegnato tutti gli esperimenti in quattro frasi:
+> Ecco cosa ci hanno insegnato gli esperimenti da v1 a v2 in quattro frasi:
 > 1. **LangGraph è praticamente gratis**: il costo del "direttore d'orchestra" è meno di 4 millesimi di secondo (un battito di ciglia).
 > 2. **Il nostro esecutore a eventi fa risparmiare davvero tempo**: quando gli strumenti hanno tempi di risposta diversi, finisce fino a un terzo prima rispetto a uno schema a ondate rigide.
 > 3. **I retry del compilatore (v2) e il "pensiero profondo" (`reasoning=True`) sono come due paia di occhiali diversi**: i retry correggono gli errori di distrazione (nomi di strumenti sbagliati, collegamenti scritti male) senza rallentare mai i casi già giusti; il pensiero profondo corregge gli errori di ragionamento matematico (come ricordarsi di dividere una percentuale per 100), ma fa riflettere il modello molto più a lungo e ogni tanto rischia di farlo "incartare" nei suoi stessi pensieri se non gli metti una sveglia.
 > 4. **Insieme fanno la differenza**: sui test facili basta la modalità veloce per fare 100%, ma sui test difficili con tanti strumenti-trappola è l'abbinamento **v2 + pensiero profondo** a portare il punteggio dal 17% fino al **100% perfetto (6 su 6)**!
+
+---
+
+### 4.6 Runtime Replanning (v2 vs v3): fallback, alias, scoperta 2-stage e controllo anti-spreco
+
+Script: `experiments/benchmark_v3_replanning.py` — Report: `results/v3_replanning_v2_vs_v3_20261120T002403Z.json`
+
+Per misurare il valore reale di **v3 (`joiner -> planner`)** rispetto a **v2 (`max_replans=0`)**, abbiamo costruito 4 scenari che nessun compilatore statico può risolvere al Round 1, eseguiti su `qwen3:8b` in modalità veloce (`planner_reasoning=False`, `joiner_reasoning=False`, `max_compile_retries=2`):
+
+| Versione (`reasoning=False`) | Status OK | Accuratezza Numerica Esatta | Replans | Anti-spreco (`Atlantis`) | LLM Calls | Med Wall |
+| :--- | :---: | :---: | :---: | :---: | :---: | ---: |
+| **`v2` (`replans=0`)** | 1/4 (**25%**) | 1/4 (**25%**) | 0 | `True` | 8 | `4.15 s` |
+| **`v3` (`replans=2`)** | **4/4 (100%)** | **4/4 (100%)** | **3** | **`True`** (`0` sprechi) | 16 | **`9.09 s`** |
+
+#### Dettaglio per scenario (`v2` vs `v3`, `reasoning=False`)
+
+| Scenario | Sfida runtime | Esito v2 | Esito v3 | Replans | Compile Retries | Tempo v3 |
+| :--- | :--- | :---: | :---: | :---: | :---: | ---: |
+| `r01_fx_primary_to_backup` | `fx_primary` ritorna `503 Service Unavailable` → fallback a `fx_backup` | `partial` (MISS) | **`complete` · `EXACT`** (`2116`, `4163`, `2047`) | 1 | 0 | `10.35 s` |
+| `r02_alias_recovery` | `country_stats('UK')` fallisce con hint `'Did you mean United Kingdom?'` | `partial` (MISS) | **`complete` · `EXACT`** (`2300`, `3340`, `5640`) | 1 | 2 *(v2+v3 insieme)* | `15.72 s` |
+| `r03_two_stage_discovery` | Coorte opaca `'Atlas-7'` scoperta al Round 1 → `['Spain', 'Portugal']` al Round 2 | `partial` (MISS) | **`complete` · `EXACT`** (`1580`, `287`, `1867`) | 1 | 0 | **`7.83 s`** |
+| `r04_unrecoverable_control` | `'Atlantis'` inesistente (nessun tool alternativo nel catalogo) | `partial` (`EXACT`) | **`partial` · `EXACT`** (`195.76`) | **0** | 0 | `4.31 s` |
+
+#### Lezioni ingegneristiche emerse dai test live su v3
+1. **Non esporre mai i vecchi `task_id` nel `replan_context`**: in un test preliminare su `r02`, mostrare `task_1 (country_stats)` nel contesto di replan induceva `qwen3:8b` a scrivere `InputBinding(task_id="task_1", ...)` nel Round 2 (dove `task_1` del Round 1 non esiste!), esaurendo i compile retry — caso in cui è comunque scattata dal vivo la **Graceful Degradation** salvando la risposta parziale del Round 1. Omettendo i vecchi `task_id` in `format_replan_context` e citando i soli valori letterali (`Italy: 2300.0`), il modello li ha copiati pulitamente come input statici portando la suite al **4/4 (100%)**.
+2. **Prevenire il *data leakage* nei benchmark di discovery**: usando inizialmente il nome geografico `'Iberia'` invece di un codice opaco, il modello in thinking mode aveva indovinato a memoria `Spain` e `Portugal` al Round 1 (`replans=0`, `180 s`), aggirando la scoperta a 2 stadi. Sostituirlo con la coorte sintetica opaca `'Atlas-7'` ha reso il test metodologicamente rigoroso e ha dimostrato un vero replanning 2-stage in **`7.83 s`**.
+3. **Zero sprechi sugli errori irrecuperabili**: grazie alla visibilità di `tool_catalog` nel `Joiner`, su `r04_unrecoverable_control` (`Atlantis`) **v3** ha scelto subito `finish` (`replan_attempts=0`, `4.31 s`), confermando che il replan scatta solo quando c'è una reale via di recupero.
+4. **Sinergia v2 + v3**: su `r02_alias_recovery`, il Round 2 ha beneficiato del budget fresco di compile retry (`c_ret=2`) *all'interno* del replan runtime, recuperando fino al risultato esatto (`5640`).
+
+> **In parole semplici:**
+> Se **v2** è il correttore di bozze che sistema gli errori *prima* di uscire di casa, **v3** è la capacità di **improvvisare con intelligenza sul campo** quando capita un imprevisto reale:
+> * Se la strada principale è chiusa per lavori (`fx_primary` in errore 503), guarda la mappa degli strumenti e prende la strada alternativa (`fx_backup`) senza rifare da capo i pezzi di viaggio già completati.
+> * Se allo sportello gli rispondono *"UK non trovato, intendevi United Kingdom?"*, corregge il nome al volo e completa l'operazione.
+> * Se deve prima aprire una busta chiusa (`Atlas-7`) per leggere quali Paesi contiene, apre la busta al primo giro e poi raccoglie i dati di tutti i Paesi trovati al secondo giro.
+> * E se invece cerca qualcosa che non esiste proprio (come *Atlantide*), capisce subito che non c'è nessun altro sportello a cui chiedere e non perde tempo in giri a vuoto!
 
 ---
 
@@ -690,7 +737,7 @@ langgraph-llm-compiler/
 │       ├── llm.py                     # Factory ChatOllama (configurazione modello, temperature, reasoning)
 │       ├── planner/
 │       │   ├── schemas.py             # NonEmptyStr, InputBinding, TaskSpec (inputs unificato), ExecutionPlan
-│       │   └── planner.py             # Planner (plan / aplan + retry feedback), SYSTEM_PROMPT neutro, PlannerOutputError
+│       │   └── planner.py             # Planner (plan / aplan + compile feedback v2 + replan_context v3)
 │       ├── compiler/
 │       │   ├── registry.py            # ToolSpec, ToolRegistry (source of truth + to_planner_catalog)
 │       │   ├── dag.py                 # CompilationIssue, PlanCompilationError, CompiledDAG (immutabile)
@@ -700,13 +747,13 @@ langgraph-llm-compiler/
 │       │   ├── bindings.py            # BindingResolutionError, resolve_output_path, resolve_task_inputs
 │       │   └── executor.py            # Executor (scheduler asyncio event-driven, best-effort, timeout)
 │       ├── joiner/
-│       │   ├── schemas.py             # JoinerStatus, JoinerOutput (LLM), JoinerResult (app)
-│       │   └── joiner.py              # Joiner (async join), classificazione deterministica, JoinerOutputError
+│       │   ├── schemas.py             # ExecutionRound, JoinerOutput, JoinerDecisionOutput, JoinerResult
+│       │   └── joiner.py              # Joiner (finish / replan), classificazione multi-round, format_replan_context
 │       └── graph/
 │           ├── state.py               # CompilerState, WorkflowError, WorkflowMetrics, update_metrics
-│           ├── nodes.py               # 4 nodi async sottili (planner, compiler, executor, joiner)
-│           └── builder.py             # build_compiler_graph(..., max_compile_retries=0) -> CompiledStateGraph
-├── tests/                             # 57 test unitari deterministici (zero dipendenza da Ollama)
+│           ├── nodes.py               # 4 nodi async sottili con retry v2, replan v3 e graceful degradation
+│           └── builder.py             # build_compiler_graph(..., max_compile_retries=0, max_replans=0)
+├── tests/                             # 67 test unitari deterministici (zero dipendenza da Ollama)
 │   ├── test_planner_schemas.py
 │   ├── test_planner.py
 │   ├── test_compiler.py
@@ -719,6 +766,7 @@ langgraph-llm-compiler/
 │   ├── test2.py                       # Trace visivo fase-per-fase via astream + export PNG/Mermaid in results/
 │   ├── benchmark_v1_baseline.py       # Suite baseline v1 (4 tool, 8 query, reasoning=False vs True)
 │   ├── benchmark_v2_hard_suite.py     # Hard suite 10 tool con grading numerico automatico: v1 vs v2
+│   ├── benchmark_v3_replanning.py     # Suite runtime replanning v2 vs v3 (fallback, alias, 2-stage, no-waste)
 │   └── benchmark_scheduling.py        # Benchmark deterministico Event-driven vs LangGraph Pregel BSP vs Seq
 └── results/                           # Output sperimentali salvati (JSON, PNG dello StateGraph, report Mermaid)
 ```
@@ -735,7 +783,7 @@ langgraph-llm-compiler/
 # Installa tutte le dipendenze (inclusi pytest, ruff e grandalf per draw_ascii)
 uv sync
 
-# Esegui la suite completa di 57 test unitari deterministici
+# Esegui la suite completa di 67 test unitari deterministici
 uv run pytest -v
 
 # Controllo statico stile e qualità con ruff
@@ -764,17 +812,20 @@ uv run python experiments/benchmark_v1_baseline.py --reasoning-modes both
 # Hard suite 10 tool: confronto v1 (0 retry) vs v2 (2 retry) con grading numerico automatico
 uv run python experiments/benchmark_v2_hard_suite.py
 uv run python experiments/benchmark_v2_hard_suite.py --reasoning
+
+# Suite runtime replanning: confronto v2 (0 replan) vs v3 (2 replan)
+uv run python experiments/benchmark_v3_replanning.py
 ```
 
 ---
 
 ## 7. Roadmap
 
-- [x] **Planner**: schemi Pydantic (`inputs` unificato Strada A), structured output `json_schema`, prompt neutro anti-overfitting, test unitari.
+- [x] **Planner**: schemi Pydantic (`inputs` unificato Strada A), structured output `json_schema`, prompt neutro anti-overfitting, supporto a compile feedback v2 e `replan_context` v3, test unitari.
 - [x] **Compiler**: `ToolRegistry`, validazione semantica in singola passata (incluso `malformed_binding` e `invalid_output_path` multi-livello), algoritmo di Kahn, `CompiledDAG` immutabile, test unitari.
 - [x] **Executor**: scheduler `asyncio` event-driven, binding resolution, validazione runtime I/O, best-effort + propagazione `skipped`, `max_concurrency`, `task_timeout_s`, telemetria serializzabile, test unitari.
-- [x] **Joiner v1**: sintesi risposta finale nella lingua dell'utente (`JoinerOutput`), `status` e `missing_information` deterministici (`JoinerResult`), test unitari.
+- [x] **Joiner v1 → v3**: sintesi risposta finale nella lingua dell'utente (`JoinerOutput`), decisione `finish`/`replan` informata dal catalogo (`JoinerDecisionOutput`), `status` e `missing_information` deterministici multi-round (`JoinerResult`), test unitari.
 - [x] **LangGraph v1**: `StateGraph` lineare con uscite condizionali su errore, `WorkflowMetrics`, benchmark overhead isolato e benchmark deterministico di scheduling (Event-driven vs Pregel BSP).
 - [x] **v2 — Compile-time self-correction**: ciclo `compiler -> planner` con `previous_plan`, `compile_feedback` (`CompilationIssue`), `compile_error_history`, latenze cumulative, `max_compile_retries` retrocompatibile e Hard Suite 10 tool (matrice 2×2).
-- [ ] **v3 — Runtime replanning**: ciclo `joiner -> planner` con risultati parziali, strumenti di fallback e budget `max_replans`.
+- [x] **v3 — Runtime replanning**: ciclo `joiner -> planner` (Context-Injected Replanning), `execution_history`, budget separati per round, Graceful Degradation (`replan_error`), suite di 67 test unitari e benchmark live v2 vs v3 (`25% -> 100%` a `reasoning=False`).
 - [ ] **Fase 6 — Benchmark comparativi cross-architettura**: confronto riproducibile *apples-to-apples* tra LLM Compiler (v1/v2/v3) e agenti iterativi (es. LangGraph ReAct) su latenza, chiamate LLM, token e accuratezza.

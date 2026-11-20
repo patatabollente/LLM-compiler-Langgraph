@@ -25,6 +25,7 @@ Follow these rules:
 10. Make sure all referenced tasks exist in the execution plan and never reference a task's own task_id.
 11. Avoid circular dependencies.
 12. Respect the input parameter names and output structure described in the tool catalog.
+13. If a follow-up step requires calling a tool separately for each element of a list whose items are only known at runtime (and cannot be bound via a single scalar output_path), plan ONLY the discovery task(s) in this plan — do NOT invent list-index paths or pass a list into a scalar parameter.
 
 Examples of valid tasks (using abstract placeholder tool names — always use only tools from AVAILABLE TOOLS):
 
@@ -94,6 +95,7 @@ class Planner:
         *,
         previous_plan: ExecutionPlan | None = None,
         feedback: str | None = None,
+        replan_context: str | None = None,
     ) -> list[SystemMessage | HumanMessage]:
         if not request.strip():
             raise ValueError("The user request cannot be empty.")
@@ -114,6 +116,20 @@ class Planner:
             f"AVAILABLE TOOLS:\n{tool_catalog}",
             f"USER REQUEST:\n{request.strip()}",
         ]
+
+        normalized_replan = replan_context.strip() if replan_context else ""
+        if normalized_replan:
+            sections.append(
+                f"RUNTIME REPLANNING CONTEXT (PREVIOUS ROUNDS):\n{normalized_replan}\n\n"
+                "Generate a fresh, self-contained follow-up ExecutionPlan covering ONLY "
+                "the remaining or fallback steps needed to fulfill the user request.\n"
+                "IMPORTANT RULES FOR REPLANNING:\n"
+                "- Do NOT re-run calls that already succeeded.\n"
+                "- Do NOT repeat failed tool calls with identical arguments.\n"
+                "- Every InputBinding may ONLY reference task_ids defined inside THIS "
+                "new plan. NEVER reference a task_id from a previous round; copy any "
+                "already-retrieved literal value (number or string) directly into inputs."
+            )
 
         normalized_feedback = feedback.strip() if feedback else ""
         if normalized_feedback:
@@ -154,6 +170,7 @@ class Planner:
         *,
         previous_plan: ExecutionPlan | None = None,
         feedback: str | None = None,
+        replan_context: str | None = None,
     ) -> ExecutionPlan:
         """Generate a validated ExecutionPlan synchronously."""
         messages = self._build_messages(
@@ -161,6 +178,7 @@ class Planner:
             available_tools,
             previous_plan=previous_plan,
             feedback=feedback,
+            replan_context=replan_context,
         )
         response = self._structured_llm.invoke(messages)
         return self._extract_plan(response)
@@ -172,6 +190,7 @@ class Planner:
         *,
         previous_plan: ExecutionPlan | None = None,
         feedback: str | None = None,
+        replan_context: str | None = None,
     ) -> ExecutionPlan:
         """Generate a validated ExecutionPlan asynchronously."""
         messages = self._build_messages(
@@ -179,6 +198,7 @@ class Planner:
             available_tools,
             previous_plan=previous_plan,
             feedback=feedback,
+            replan_context=replan_context,
         )
         response = await self._structured_llm.ainvoke(messages)
         return self._extract_plan(response)

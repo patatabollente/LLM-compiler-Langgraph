@@ -11,7 +11,7 @@ from langgraph_llm_compiler.graph import (
     WorkflowMetrics,
     build_compiler_graph,
 )
-from langgraph_llm_compiler.joiner import Joiner, JoinerOutput
+from langgraph_llm_compiler.joiner import Joiner, JoinerDecisionOutput, JoinerOutput
 from langgraph_llm_compiler.planner import (
     ExecutionPlan,
     InputBinding,
@@ -729,4 +729,387 @@ def test_graph_v2_streaming_order_with_compile_retry():
         "executor",
         "joiner",
     ]
+
+
+class SchemaDispatchChatModel:
+    """Fake chat model returning a dedicated sequence runnable per requested schema."""
+
+    def __init__(self, responses_by_schema: dict[type[Any], list[dict[str, Any]]]) -> None:
+        self.runnables: dict[type[Any], SequenceStructuredRunnable] = {
+            schema: SequenceStructuredRunnable(resps)
+            for schema, resps in responses_by_schema.items()
+        }
+        self.requested_schemas: list[type[Any]] = []
+
+    def with_structured_output(self, **kwargs: Any) -> SequenceStructuredRunnable:
+        schema = kwargs["schema"]
+        self.requested_schemas.append(schema)
+        return self.runnables[schema]
+
+
+def _build_registry_with_backup() -> ToolRegistry:
+    """Registry where primary population_lookup fails for Italy, backup_lookup succeeds."""
+
+    async def primary_lookup(country: str) -> dict[str, str | int]:
+        if country.lower() == "italy":
+            raise RuntimeError("Primary lookup service unavailable for Italy")
+        pops = {"france": 68_400_000}
+        return {"country": country, "population": pops[country.lower()]}
+
+    async def backup_lookup(country: str) -> dict[str, str | int]:
+        pops = {"italy": 58_990_000, "france": 68_400_000}
+        return {"country": country, "population": pops[country.lower()]}
+
+    def calc(
+        operation: Literal["add", "subtract", "multiply", "divide"],
+        a: float,
+        b: float,
+    ) -> dict[str, float]:
+        if operation == "subtract":
+            return {"result": a - b}
+        return {"result": a + b}
+
+    return ToolRegistry(
+        [
+            ToolSpec(
+                name="population_lookup",
+                description="Primary country population lookup",
+                func=primary_lookup,
+                input_schema=PopulationInput,
+                output_schema=PopulationOutput,
+            ),
+            ToolSpec(
+                name="backup_lookup",
+                description="Backup country population lookup",
+                func=backup_lookup,
+                input_schema=PopulationInput,
+                output_schema=PopulationOutput,
+            ),
+            ToolSpec(
+                name="calculator",
+                description="Binary arithmetic",
+                func=calc,
+                input_schema=CalculatorInput,
+                output_schema=CalculatorOutput,
+            ),
+        ]
+    )
+
+
+def _round2_backup_plan() -> ExecutionPlan:
+    return ExecutionPlan(
+        objective="Recover Italy via backup_lookup and subtract France (68400000).",
+        tasks=[
+            TaskSpec(
+                task_id="task_1",
+                tool_name="backup_lookup",
+                description="Get Italy population from backup.",
+                inputs={"country": "Italy"},
+            ),
+            TaskSpec(
+                task_id="task_2",
+                tool_name="calculator",
+                description="Subtract France population from Italy.",
+                inputs={
+                    "operation": "subtract",
+                    "a": InputBinding(task_id="task_1", output_path=["population"]),
+                    "b": 68_400_000,
+                },
+            ),
+        ],
+    )
+
+
+def test_graph_rejects_negative_max_replans():
+    registry = _build_registry()
+    planner_llm = FakeChatModel(
+        {"parsed": _valid_plan(), "parsing_error": None, "raw": "{}"}
+    )
+    joiner_llm = FakeChatModel(
+        {"parsed": JoinerOutput(answer="ok"), "parsing_error": None, "raw": "{}"}
+    )
+
+    with pytest.raises(ValueError, match="max_replans"):
+        build_compiler_graph(
+            registry=registry,
+            planner=Planner(llm=planner_llm),  # type: ignore[arg-type]
+            compiler=PlanCompiler(registry=registry),
+            executor=Executor(registry=registry),
+            joiner=Joiner(llm=joiner_llm),  # type: ignore[arg-type]
+            max_replans=-1,
+        )
+
+
+def test_graph_v3_runtime_replan_recovers_via_backup_tool():
+    registry = _build_registry_with_backup()
+    round1_plan = _valid_plan()
+    round2_plan = _round2_backup_plan()
+
+    planner_llm = SequenceChatModel(
+        [
+            {"parsed": round1_plan, "parsing_error": None, "raw": "{r1}"},
+            {"parsed": round2_plan, "parsing_error": None, "raw": "{r2}"},
+        ]
+    )
+    joiner_llm = SchemaDispatchChatModel(
+        {
+            JoinerDecisionOutput: [
+                {
+                    "parsed": JoinerDecisionOutput(
+                        action="replan",
+                        replan_reason=(
+                            "population_lookup failed for Italy; use backup_lookup for "
+                            "Italy and compute Italy minus France (68400000)."
+                        ),
+                    ),
+                    "parsing_error": None,
+                    "raw": "{replan}",
+                }
+            ],
+            JoinerOutput: [
+                {
+                    "parsed": JoinerOutput(
+                        answer="Differenza Italia meno Francia: -9.410.000."
+                    ),
+                    "parsing_error": None,
+                    "raw": "{finish}",
+                }
+            ],
+        }
+    )
+
+    graph = build_compiler_graph(
+        registry=registry,
+        planner=Planner(llm=planner_llm),  # type: ignore[arg-type]
+        compiler=PlanCompiler(registry=registry),
+        executor=Executor(registry=registry),
+        joiner=Joiner(llm=joiner_llm),  # type: ignore[arg-type]
+        max_compile_retries=1,
+        max_replans=1,
+    )
+
+    mermaid = graph.get_graph().draw_mermaid()
+    assert "joiner -.-> planner" in mermaid
+    assert "compiler -.-> planner" in mermaid
+
+    final_state = asyncio.run(graph.ainvoke({"request": "Italia meno Francia"}))
+
+    assert final_state["status"] == "complete"
+    assert final_state["error"] is None
+    assert final_state.get("replan_error") is None
+    assert final_state["final_answer"] == "Differenza Italia meno Francia: -9.410.000."
+    assert final_state["execution_result"] is not None
+    assert final_state["execution_result"].results["task_2"].output == {
+        "result": -9_410_000.0
+    }
+
+    # Execution history preserves Round 1 snapshot.
+    history = final_state["execution_history"]
+    assert len(history) == 1
+    assert history[0].round_index == 1
+    assert history[0].execution_result.failed_task_ids == ("task_1",)
+
+    # Round 2 Planner prompt received the replan context with Round 1 France output.
+    round2_prompt = planner_llm.runnable.received_messages[1][1].content
+    assert "RUNTIME REPLANNING CONTEXT (PREVIOUS ROUNDS):" in round2_prompt
+    assert "backup_lookup" in round2_prompt
+    assert "68400000" in round2_prompt
+
+    # Round 2 Joiner hit max_replans=1 cap -> forced JoinerOutput with Round 1 history.
+    final_joiner_prompt = (
+        joiner_llm.runnables[JoinerOutput].received_messages[0][1].content
+    )
+    assert "PREVIOUS EXECUTION ROUNDS:" in final_joiner_prompt
+    assert "Round 1" in final_joiner_prompt
+
+    metrics = final_state["metrics"]
+    assert metrics.replan_attempts == 1
+    assert metrics.compile_attempts == 2
+    assert metrics.compile_retries == 0  # 0 compile retries despite 2 rounds!
+    assert metrics.llm_calls == 4  # 2 planner + 2 joiner
+    assert metrics.plan_valid is True
+
+
+def test_graph_v3_and_v2_fresh_compile_retry_budget_on_round_2():
+    """Round 1 uses 1 compile retry, then replans; Round 2 gets a fresh retry budget."""
+    registry = _build_registry_with_backup()
+    bad_round2_plan = ExecutionPlan(
+        objective="Bad round 2 plan with unknown tool",
+        tasks=[
+            TaskSpec(
+                task_id="task_1",
+                tool_name="nonexistent_backup",
+                description="Wrong backup tool name",
+                inputs={"country": "Italy"},
+            )
+        ],
+    )
+
+    planner_llm = SequenceChatModel(
+        [
+            {"parsed": _malformed_binding_plan(), "parsing_error": None, "raw": "{r1b}"},
+            {"parsed": _valid_plan(), "parsing_error": None, "raw": "{r1g}"},
+            {"parsed": bad_round2_plan, "parsing_error": None, "raw": "{r2b}"},
+            {"parsed": _round2_backup_plan(), "parsing_error": None, "raw": "{r2g}"},
+        ]
+    )
+    joiner_llm = SchemaDispatchChatModel(
+        {
+            JoinerDecisionOutput: [
+                {
+                    "parsed": JoinerDecisionOutput(
+                        action="replan",
+                        replan_reason="Use backup_lookup for Italy.",
+                    ),
+                    "parsing_error": None,
+                    "raw": "{replan}",
+                }
+            ],
+            JoinerOutput: [
+                {
+                    "parsed": JoinerOutput(answer="Recuperato: -9.410.000."),
+                    "parsing_error": None,
+                    "raw": "{finish}",
+                }
+            ],
+        }
+    )
+
+    graph = build_compiler_graph(
+        registry=registry,
+        planner=Planner(llm=planner_llm),  # type: ignore[arg-type]
+        compiler=PlanCompiler(registry=registry),
+        executor=Executor(registry=registry),
+        joiner=Joiner(llm=joiner_llm),  # type: ignore[arg-type]
+        max_compile_retries=1,
+        max_replans=1,
+    )
+
+    final_state = asyncio.run(graph.ainvoke({"request": "Italia meno Francia"}))
+
+    assert final_state["status"] == "complete"
+    assert final_state["error"] is None
+    assert final_state["final_answer"] == "Recuperato: -9.410.000."
+
+    # On Round 2 compile retry (call index 3), Planner must receive BOTH replan_context
+    # AND compile feedback!
+    round2_retry_prompt = planner_llm.runnable.received_messages[3][1].content
+    assert "RUNTIME REPLANNING CONTEXT (PREVIOUS ROUNDS):" in round2_retry_prompt
+    assert "Use backup_lookup for Italy." in round2_retry_prompt
+    assert "COMPILATION ERRORS TO FIX:" in round2_retry_prompt
+    assert "nonexistent_backup" in round2_retry_prompt
+
+    metrics = final_state["metrics"]
+    assert metrics.replan_attempts == 1
+    assert metrics.compile_attempts == 4
+    assert metrics.compile_retries == 2  # 1 in Round 1 + 1 in Round 2
+    assert metrics.llm_calls == 6  # 4 planner + 2 joiner
+    assert metrics.plan_valid is True
+
+
+def test_graph_v3_graceful_degradation_when_replan_planner_fails():
+    """If Round 2 fails at Planner, v3 must fall back to Joiner with Round 1 partial results."""
+    registry = _build_registry_with_backup()
+
+    planner_llm = SequenceChatModel(
+        [
+            {"parsed": _valid_plan(), "parsing_error": None, "raw": "{r1}"},
+            {
+                "parsed": None,
+                "parsing_error": ValueError("truncated JSON on round 2"),
+                "raw": "{truncated",
+            },
+        ]
+    )
+    joiner_llm = SchemaDispatchChatModel(
+        {
+            JoinerDecisionOutput: [
+                {
+                    "parsed": JoinerDecisionOutput(
+                        action="replan",
+                        replan_reason="Try backup_lookup for Italy.",
+                    ),
+                    "parsing_error": None,
+                    "raw": "{replan}",
+                }
+            ],
+            JoinerOutput: [
+                {
+                    "parsed": JoinerOutput(
+                        answer="Risposta parziale dal Round 1: Francia = 68.400.000."
+                    ),
+                    "parsing_error": None,
+                    "raw": "{fallback_finish}",
+                }
+            ],
+        }
+    )
+
+    graph = build_compiler_graph(
+        registry=registry,
+        planner=Planner(llm=planner_llm),  # type: ignore[arg-type]
+        compiler=PlanCompiler(registry=registry),
+        executor=Executor(registry=registry),
+        joiner=Joiner(llm=joiner_llm),  # type: ignore[arg-type]
+        max_compile_retries=1,
+        max_replans=2,
+    )
+
+    final_state = asyncio.run(graph.ainvoke({"request": "Italia meno Francia"}))
+
+    # Preserves Round 1 partial answer instead of crashing to final_answer=None!
+    assert final_state["status"] == "partial"
+    assert final_state["error"] is None
+    assert final_state["final_answer"] == (
+        "Risposta parziale dal Round 1: Francia = 68.400.000."
+    )
+    replan_err = final_state.get("replan_error")
+    assert replan_err is not None
+    assert replan_err.stage == "planner"
+    assert replan_err.error_type == "PlannerOutputError"
+    assert final_state["metrics"].replan_attempts == 1
+    assert final_state["metrics"].llm_calls == 4
+
+
+def test_graph_v3_finishes_on_round_1_without_replan_overhead():
+    """When Joiner chooses finish on Round 1, v3 terminates cleanly with 0 replans."""
+    registry = _build_registry()
+    planner_llm = FakeChatModel(
+        {"parsed": _valid_plan(), "parsing_error": None, "raw": "{}"}
+    )
+    joiner_llm = SchemaDispatchChatModel(
+        {
+            JoinerDecisionOutput: [
+                {
+                    "parsed": JoinerDecisionOutput(
+                        action="finish",
+                        answer="Differenza: -9.410.000.",
+                    ),
+                    "parsing_error": None,
+                    "raw": "{finish}",
+                }
+            ],
+            JoinerOutput: [],
+        }
+    )
+
+    graph = build_compiler_graph(
+        registry=registry,
+        planner=Planner(llm=planner_llm),  # type: ignore[arg-type]
+        compiler=PlanCompiler(registry=registry),
+        executor=Executor(registry=registry),
+        joiner=Joiner(llm=joiner_llm),  # type: ignore[arg-type]
+        max_compile_retries=1,
+        max_replans=2,
+    )
+
+    final_state = asyncio.run(graph.ainvoke({"request": "Italia meno Francia"}))
+
+    assert final_state["status"] == "complete"
+    assert final_state["error"] is None
+    assert final_state["final_answer"] == "Differenza: -9.410.000."
+    assert final_state["metrics"].replan_attempts == 0
+    assert final_state["metrics"].llm_calls == 2
+    assert len(joiner_llm.runnables[JoinerOutput].received_messages) == 0
+
 

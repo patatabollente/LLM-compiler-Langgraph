@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from langgraph_llm_compiler.compiler.dag import CompiledDAG
 from langgraph_llm_compiler.executor.results import ExecutionResult
-from langgraph_llm_compiler.joiner.schemas import JoinerResult
+from langgraph_llm_compiler.joiner.schemas import ExecutionRound, JoinerResult
 from langgraph_llm_compiler.planner.schemas import ExecutionPlan
 
 WorkflowStage = Literal["planner", "compiler", "executor", "joiner"]
@@ -12,7 +12,7 @@ WorkflowStatus = Literal["complete", "partial", "failed"]
 
 
 class WorkflowError(BaseModel):
-    """Serializable error recorded when a workflow node fails fatally."""
+    """Serializable error recorded when a workflow node fails."""
 
     model_config = ConfigDict(
         extra="forbid",
@@ -37,13 +37,9 @@ class WorkflowMetrics(BaseModel):
     joining_latency_ms: float | None = None
     llm_calls: int = 0
     compile_attempts: int = 0
+    compile_retries: int = 0
     replan_attempts: int = 0
     plan_valid: bool | None = None
-
-    @property
-    def compile_retries(self) -> int:
-        """Number of compile-time self-correction retries actually performed."""
-        return max(0, self.compile_attempts - 1)
 
     @property
     def component_latency_ms(self) -> float:
@@ -68,8 +64,13 @@ class CompilerState(TypedDict, total=False):
     final_answer: NotRequired[str | None]
     status: NotRequired[WorkflowStatus | None]
     error: NotRequired[WorkflowError | None]
+    replan_error: NotRequired[WorkflowError | None]
     compile_feedback: NotRequired[str | None]
     compile_error_history: NotRequired[list[list[str]]]
+    round_compile_attempts: NotRequired[int]
+    execution_history: NotRequired[list[ExecutionRound]]
+    replan_reason: NotRequired[str | None]
+    replan_context: NotRequired[str | None]
     metrics: NotRequired[WorkflowMetrics]
 
 
