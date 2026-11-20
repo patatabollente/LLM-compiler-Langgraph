@@ -32,6 +32,7 @@ Il progetto è progettato con tre obiettivi primari: **correttezza formale** (co
    - [4.4 Hard Suite 10 tool: matrice 2x2 (v1 vs v2 e reasoning)](#44-hard-suite-10-tool-matrice-2x2-v1-vs-v2-e-reasoning)
    - [4.5 Cosa cambia con i retry (v2): vantaggi, svantaggi e guida alla scelta](#45-cosa-cambia-con-i-retry-v2-vantaggi-svantaggi-e-guida-alla-scelta)
    - [4.6 Runtime Replanning (v2 vs v3): fallback, alias, scoperta 2-stage e controllo anti-spreco](#46-runtime-replanning-v2-vs-v3-fallback-alias-scoperta-2-stage-e-controllo-anti-spreco)
+   - [4.7 Confronto cross-architettura: LLM Compiler v3 vs LangGraph ReAct](#47-confronto-cross-architettura-llm-compiler-v3-vs-langgraph-react)
 5. [Struttura del repository](#5-struttura-del-repository)
 6. [Setup, verifica e comandi per gli esperimenti](#6-setup-verifica-e-comandi-per-gli-esperimenti)
 7. [Roadmap](#7-roadmap)
@@ -726,6 +727,49 @@ Per misurare il valore reale di **v3 (`joiner -> planner`)** rispetto a **v2 (`m
 
 ---
 
+### 4.7 Confronto cross-architettura: LLM Compiler v3 vs LangGraph ReAct
+
+Script: `experiments/benchmark_compiler_vs_react.py --suite both`
+Report: `results/compiler_vs_react_both_20261120T004632Z.json`
+
+Per valutare in modo rigoroso e imparziale (**apples-to-apples**) la nostra architettura contro un agente iterativo standard, abbiamo confrontato **LLM Compiler v3** (`max_compile_retries=2`, `max_replans=2`) e un **agente ReAct in LangGraph** (con `ToolNode` parallelo abilitato così da riconoscere a ReAct pieno merito del *native parallel tool calling* di `qwen3:8b`). Entrambi hanno condiviso lo **stesso identico modello** (`qwen3:8b`, `temperature=0.0`, `reasoning=False`, `num_predict=2048`), gli **stessi handler/latenze** e lo **stesso callback di conteggio token**, su **due regimi distinti**:
+
+#### Suite A — `STANDARD` (6 casi: tool veloci 40–180 ms + aritmetica + fallback + alias + `Atlantis`)
+
+| Architettura | Esatti | Med Wall | Tot LLM (Med) | Tool chiamati | Token Tot (In / Out) |
+| :--- | :---: | ---: | :---: | :---: | :---: |
+| **LLM Compiler v3** | **6/6 (100%)** | `13.51 s` | **18** (`3.0`) | 51 | `35,747` (`26,809` / `8,938`) |
+| **LangGraph ReAct** | 5/6 (83%) | **`4.05 s`** | 20 (`3.0`) | 28 *(conti a mente!)* | **`19,592`** (`17,733` / `1,859`) |
+
+#### Suite B — `IO_HEAVY` (3 casi: 7–14 API opache asimmetriche 250–750 ms, non calcolabili a mente)
+
+| Architettura | Esatti | Med Wall | Tot LLM (Med) | Tool chiamati | Token In | Token Out | **Token Totali** |
+| :--- | :---: | ---: | :---: | :---: | ---: | ---: | ---: |
+| **LLM Compiler v3** | **3/3 (100%)** | `12.08 s` | **`6` (`2.0`)** | 31 | **`8,259`** | `2,894` | **`11,153`** |
+| **LangGraph ReAct** | **3/3 (100%)** | **`7.04 s`** | `14` (`5.0`) | 30 | `14,116` | **`1,323`** | `15,439` |
+| **Delta Compiler vs ReAct** | Parità (100%) | `+5.04 s` *(locale)* | **`-57.1%` chiamate** | Parità | **`-41.5%` input** | `+1,571` out | **`-27.8%` totali** |
+
+#### Analisi critica (cosa rivelano davvero questi numeri)
+
+1. **Correttezza e garanzie formali (`9/9 = 100%` vs `8/9 = 89%`)**:
+   * Su `STANDARD`, ReAct ha frequentemente ignorato i tool aritmetici (chiamando solo `28` tool contro `51`), facendo i conti a mente: su `c05` ha introdotto imprecisioni di arrotondamento (`123.9` vs `123.98`, `95.5` vs `95.56`) e su **`c01_multi_branch_diamond` ha sbagliato entrambi i risultati finali (`66.55%` invece di `90.55%` e `94.4` invece di `40.49`)**.
+   * **LLM Compiler v3** ha ottenuto **9/9 (100%) esatti** passando sempre da tool validati con Pydantic e generando un `CompiledDAG` ispezionabile *prima* di ogni effetto collaterale (e `0` compile retry / `0` replan su tutti i DAG `IO_HEAVY`, incluso `io02` da **14 API su 4 livelli**).
+2. **Efficienza in chiamate LLM e token totali su flussi multi-hop reali (`IO_HEAVY`)**:
+   * Quando nessuna scorciatoia mentale è possibile (`30–31` chiamate API effettive per entrambi), **LLM Compiler v3** abbatte le **chiamate LLM del -57.1%** (`2.0` vs `5.0` mediana), i **token di input del -41.5%** (`8,259` vs `14,116`) e i **token totali del -27.8%** (fino al **`-35.1%`** su `io02`: `4,174` vs `6,433` token).
+3. **Il vero trade-off sulla latenza locale ("tassa di serializzazione JSON" vs KV-cache)**:
+   * Perché su Ollama locale ReAct è comunque più rapido in wall-clock (`7.04 s` vs `12.08 s` su `IO_HEAVY`, `4.05 s` vs `13.51 s` su `STANDARD`)? Perché i `14,116` token di **input** di ReAct vengono serviti quasi istantaneamente dalla **KV-cache / prefill** locale, mentre i `+1,571` token extra di **output** JSON del nostro `ExecutionPlan` (`2,894` vs `1,323`) pagano la velocità di *decode* della GPU locale.
+   * **Quando conviene ciascuna architettura**:
+     * **LangGraph ReAct** è ideale su GPU locale con tool veloci (< 200 ms), poche dipendenze concatenate e modelli che supportano *native parallel tool calling*.
+     * **LLM Compiler v3** è superiore quando servono **garanzie formali / auditabilità del DAG prima dell'esecuzione** (zero calcoli inventati a mente), su **catene API multi-hop lente (1–5 s)** o su **LLM cloud** dove risparmiare **3 round-trip sequenziali (TTFT)** e **28–35% di token** abbatte sia i costi sia la latenza end-to-end.
+4. **Lezione operativa su `num_predict`**: un run preliminare senza cap aveva mostrato un raro loop di generazione su `c06` (`8,552` output token); l'introduzione di `num_predict=2048` in `llm.py` insieme al rafforzamento della regola anti-replan su errori *does not exist* ha portato `c06` a `EXACT` con `0` replan sprecati.
+
+> **In parole semplici:**
+> Mettere faccia a faccia il nostro **LLM Compiler v3** e un agente **ReAct** standard è stato come confrontare un **ingegnere con checklist firmata** contro uno **sprinter che improvvisa a mente**:
+> * Su compiti brevi e veloci, ReAct corre più veloce in locale perché scrive messaggi cortissimi — ma ogni tanto "salta la calcolatrice" facendo i conti a mente e **sbaglia i risultati** (`c01`).
+> * Su lavori complessi con tante chiamate a servizi esterni concatenati (`IO_HEAVY`), dove non si può barare a mente, il nostro **LLM Compiler v3** parla con l'intelligenza artificiale **meno della metà delle volte (`2` chiamate contro `5`)**, consuma quasi il **30% di token in meno** e centra **9 risposte esatte su 9 (100%)** senza un solo errore di calcolo!
+
+---
+
 ## 5. Struttura del repository
 
 ```text
@@ -734,7 +778,7 @@ langgraph-llm-compiler/
 ├── README.md                          # Questa documentazione tecnica + guida in parole semplici
 ├── src/
 │   └── langgraph_llm_compiler/
-│       ├── llm.py                     # Factory ChatOllama (configurazione modello, temperature, reasoning)
+│       ├── llm.py                     # Factory ChatOllama (model, temperature, reasoning, num_predict)
 │       ├── planner/
 │       │   ├── schemas.py             # NonEmptyStr, InputBinding, TaskSpec (inputs unificato), ExecutionPlan
 │       │   └── planner.py             # Planner (plan / aplan + compile feedback v2 + replan_context v3)
@@ -767,6 +811,7 @@ langgraph-llm-compiler/
 │   ├── benchmark_v1_baseline.py       # Suite baseline v1 (4 tool, 8 query, reasoning=False vs True)
 │   ├── benchmark_v2_hard_suite.py     # Hard suite 10 tool con grading numerico automatico: v1 vs v2
 │   ├── benchmark_v3_replanning.py     # Suite runtime replanning v2 vs v3 (fallback, alias, 2-stage, no-waste)
+│   ├── benchmark_compiler_vs_react.py # Confronto apples-to-apples LLM Compiler v3 vs LangGraph ReAct (2 suite)
 │   └── benchmark_scheduling.py        # Benchmark deterministico Event-driven vs LangGraph Pregel BSP vs Seq
 └── results/                           # Output sperimentali salvati (JSON, PNG dello StateGraph, report Mermaid)
 ```
@@ -815,6 +860,9 @@ uv run python experiments/benchmark_v2_hard_suite.py --reasoning
 
 # Suite runtime replanning: confronto v2 (0 replan) vs v3 (2 replan)
 uv run python experiments/benchmark_v3_replanning.py
+
+# Confronto cross-architettura apples-to-apples: LLM Compiler v3 vs LangGraph ReAct (suite standard + io_heavy)
+uv run python experiments/benchmark_compiler_vs_react.py --suite both
 ```
 
 ---
@@ -828,4 +876,4 @@ uv run python experiments/benchmark_v3_replanning.py
 - [x] **LangGraph v1**: `StateGraph` lineare con uscite condizionali su errore, `WorkflowMetrics`, benchmark overhead isolato e benchmark deterministico di scheduling (Event-driven vs Pregel BSP).
 - [x] **v2 — Compile-time self-correction**: ciclo `compiler -> planner` con `previous_plan`, `compile_feedback` (`CompilationIssue`), `compile_error_history`, latenze cumulative, `max_compile_retries` retrocompatibile e Hard Suite 10 tool (matrice 2×2).
 - [x] **v3 — Runtime replanning**: ciclo `joiner -> planner` (Context-Injected Replanning), `execution_history`, budget separati per round, Graceful Degradation (`replan_error`), suite di 67 test unitari e benchmark live v2 vs v3 (`25% -> 100%` a `reasoning=False`).
-- [ ] **Fase 6 — Benchmark comparativi cross-architettura**: confronto riproducibile *apples-to-apples* tra LLM Compiler (v1/v2/v3) e agenti iterativi (es. LangGraph ReAct) su latenza, chiamate LLM, token e accuratezza.
+- [x] **Fase 6 — Benchmark comparativi cross-architettura**: confronto riproducibile *apples-to-apples* tra **LLM Compiler v3** e **LangGraph ReAct** su `standard` (6 casi) e `io_heavy` (3 casi multi-hop asimmetrici): **9/9 (100%)** vs `8/9 (89%)`, **-57.1% chiamate LLM** e **-27.8% token totali** su flussi multi-API.

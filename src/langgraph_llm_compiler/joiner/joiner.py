@@ -45,7 +45,7 @@ Follow these decision rules strictly:
    (b) Earlier tasks succeeded in discovering intermediate data (such as an entity name, identifier, or target value) that is required to run follow-up tool calls still needed to fulfill the ORIGINAL USER REQUEST.
 2. Choose "finish" immediately when:
    (a) All parts of the ORIGINAL USER REQUEST are already satisfied by the successful task outputs across the executed rounds, OR
-   (b) A runtime error is unrecoverable (for example, the requested entity does not exist and no alternative tool in AVAILABLE TOOLS can supply it). Never waste a replan on unrecoverable errors.
+   (b) A runtime error is unrecoverable — for example, the error states that a requested entity does not exist or has no alternative tool/dataset, and no other tool in AVAILABLE TOOLS can supply that exact same kind of source data. NEVER waste a replan on unrecoverable errors, and NEVER replan using unrelated tools (such as math or percentage tools) to substitute for missing source data.
 3. When choosing "replan", write a concise, concrete "replan_reason" stating:
    - what is still needed to fulfill the request,
    - which fallback tool or follow-up tool call(s) to use (and which failing call NOT to repeat),
