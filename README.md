@@ -33,9 +33,10 @@ Il progetto è progettato con tre obiettivi primari: **correttezza formale** (co
    - [4.5 Cosa cambia con i retry (v2): vantaggi, svantaggi e guida alla scelta](#45-cosa-cambia-con-i-retry-v2-vantaggi-svantaggi-e-guida-alla-scelta)
    - [4.6 Runtime Replanning (v2 vs v3): fallback, alias, scoperta 2-stage e controllo anti-spreco](#46-runtime-replanning-v2-vs-v3-fallback-alias-scoperta-2-stage-e-controllo-anti-spreco)
    - [4.7 Confronto cross-architettura: LLM Compiler v3 vs LangGraph ReAct](#47-confronto-cross-architettura-llm-compiler-v3-vs-langgraph-react)
-5. [Struttura del repository](#5-struttura-del-repository)
-6. [Setup, verifica e comandi per gli esperimenti](#6-setup-verifica-e-comandi-per-gli-esperimenti)
-7. [Roadmap](#7-roadmap)
+5. [Conclusioni: cosa dimostrano davvero i risultati](#5-conclusioni-cosa-dimostrano-davvero-i-risultati)
+6. [Struttura del repository](#6-struttura-del-repository)
+7. [Setup, verifica e comandi per gli esperimenti](#7-setup-verifica-e-comandi-per-gli-esperimenti)
+8. [Roadmap](#8-roadmap)
 
 ---
 
@@ -790,7 +791,36 @@ Per verificare sperimentalmente il punto esatto in cui il vantaggio dello schedu
 
 ---
 
-## 5. Struttura del repository
+## 5. Conclusioni: cosa dimostrano davvero i risultati
+
+L'insieme dei 6 benchmark eseguiti in questo repository porta a una conclusione chiara, onesta e supportata dai numeri: **non esiste un'architettura universalmente superiore in ogni regime**, ma i dati identificano con precisione *quando* e *perché* **LLM Compiler v3** diventa nettamente superiore a un agente iterativo standard (**ReAct**).
+
+### Sintesi tecnica dei 6 risultati chiave
+
+| Dimensione valutata | Risultato sperimentale misurato | Implicazione progettuale |
+| :--- | :--- | :--- |
+| **Schema di pianificazione** *(Strada A)* | Da ~2/3 di fallimenti → **16/16 (100%)** sulla suite 4 tool (`qwen3:8b`) | Unificare valori statici e `InputBinding` nello stesso dizionario `inputs` elimina per costruzione la principale fonte di errore sui modelli locali 8B. |
+| **Orchestrazione LangGraph** | Overhead puro **`+1.83 ms`** deterministico (`~3.8–4.1 ms` live, `< 0.1%`) | Usare LangGraph come orchestratore macro stateful è praticamente gratuito a fronte di streaming, cicli v2/v3 e ispezionabilità. |
+| **Motore di esecuzione DAG** | Event-driven batte LangGraph Pregel BSP fino al **`-33.7%`** su DAG asimmetrici | Tenere l'`Executor` separato da LangGraph (`asyncio` ready-queue senza barriere di superstep) è decisivo quando le API hanno latenze eterogenee. |
+| **Compile-time self-correction (v2)** | Hard Suite 10 tool: `33% -> 83%` validità (`17% -> 50%` esatti a `reasoning=False`), **`100%` (6/6)** con `reasoning=True` | `v2` e `reasoning=True` risolvono classi di errore ortogonali (contratto/schema vs logica matematica pura), con **zero costo sul caso felice**. |
+| **Runtime replanning (v3)** | Suite runtime: **`25% -> 100%`** già a `reasoning=False`, **`0` replan sprecati** su `Atlantis` | Context-Injected Replanning + visibilità di `tool_catalog` al Joiner + Graceful Degradation recuperano guasti runtime (503, alias, discovery 2-stage) senza mai peggiorare il Round 1. |
+| **LLM Compiler v3 vs ReAct** | **9/9 (100%)** vs `8/9 (89%)`; su `IO_HEAVY` **`-57.1%` chiamate LLM**, **`-27.8%` token**; crossover wall-clock a **`~3.53 s`** (fino a **`-15.5%`** a `8.0 s`) | Su tool locali istantanei (< 1–2 s) ReAct vince in latenza ma rischia errori di calcolo a mente; oltre **~3.5 s** di latenza API (o su LLM cloud con costi/TTFT per chiamata), **LLM Compiler v3 domina su latenza, chiamate LLM, token e accuratezza**. |
+
+### Quando scegliere quale architettura
+
+* **Scegli LangGraph ReAct** se operi su GPU locale con pochi tool velocissimi (`< 1–2 s`), poche dipendenze concatenate e modelli che supportano *native parallel tool calling*, e accetti il rischio che il modello aggiri occasionalmente gli strumenti di calcolo.
+* **Scegli LLM Compiler v3** quando lavori con **API esterne/database/microservizi multi-hop** (latenze reali `>= 3–4 s` o asimmetriche), con **LLM cloud** (dove ridurre le chiamate del **-57% / -60%** e i token del **-25% / -30%** abbatte sia il TTFT di rete sia la bolletta), oppure in **ambienti critici** che richiedono validazione statica del piano, zero calcoli inventati a mente e recupero automatico su errori runtime.
+
+> **In parole semplici:**
+> Alla fine tutti i nostri test ci dicono una cosa molto concreta e senza fuffa:
+> * Se devi fare un assistente semplice con 2 strumenti istantanei sul tuo PC, un agente classico (**ReAct**) è più rapido a rispondere perché scrive messaggi brevissimi — anche se ogni tanto fa i conti a mente e sbaglia.
+> * Appena costruisci un sistema serio che deve parlare con **più servizi esterni reali che impiegano qualche secondo** (API, database, servizi che possono andare giù o richiedere più passaggi), il nostro **LLM Compiler v3 vince su tutta la linea**: fa **meno della metà delle chiamate all'IA**, consuma **un quarto di token in meno**, diventa **più veloce anche sul cronometro** (oltre ~3.5 s per chiamata lenta), **non sbaglia un solo calcolo (100%)** e sa **correggersi da solo** sia prima di partire (v2) sia se trova un imprevisto lungo la strada (v3) — senza perdere tempo su ciò che non esiste davvero.
+>
+> **In una frase:** *ReAct è perfetto per prototipi veloci con tool istantanei; **LLM Compiler v3** è l'architettura vincente quando servono precisione garantita, parallelismo reale, meno costi LLM e resilienza su workflow complessi — e ora non è solo teoria, è dimostrato dai numeri.*
+
+---
+
+## 6. Struttura del repository
 
 ```text
 langgraph-llm-compiler/
@@ -839,7 +869,7 @@ langgraph-llm-compiler/
 
 ---
 
-## 6. Setup, verifica e comandi per gli esperimenti
+## 7. Setup, verifica e comandi per gli esperimenti
 
 **Requisiti:** Python `>=3.12`, [`uv`](https://docs.astral.sh/uv/) e [Ollama](https://ollama.com/) con `qwen3:8b` (`ollama pull qwen3:8b`, necessario solo per gli esperimenti live con LLM).
 
@@ -891,7 +921,7 @@ uv run python experiments/benchmark_latency_crossover.py
 
 ---
 
-## 7. Roadmap
+## 8. Roadmap
 
 - [x] **Planner**: schemi Pydantic (`inputs` unificato Strada A), structured output `json_schema`, prompt neutro anti-overfitting, supporto a compile feedback v2 e `replan_context` v3, test unitari.
 - [x] **Compiler**: `ToolRegistry`, validazione semantica in singola passata (incluso `malformed_binding` e `invalid_output_path` multi-livello), algoritmo di Kahn, `CompiledDAG` immutabile, test unitari.
