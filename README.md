@@ -160,7 +160,8 @@ Ora entra in scena il `Planner` (`planner/planner.py`). È il **primo modulo che
 * **Input:**
   * `request: str` (la frase in linguaggio naturale dell'utente);
   * `tool_catalog: dict[str, str]` (prodotto da `ToolRegistry.to_planner_catalog()`);
-  * *(solo nei retry v2)* `previous_plan: ExecutionPlan` e `feedback: str` con gli errori segnalati dal compilatore.
+  * *(solo nei retry v2)* `previous_plan: ExecutionPlan` e `feedback: str` con gli errori segnalati dal compilatore;
+  * *(solo nei replan v3)* `replan_context: str` con i valori già recuperati nei round precedenti e le indicazioni del `Joiner` (può coesistere con `previous_plan` + `feedback` se il Round 2 fa un compile retry).
 * **Cosa fa:** costruisce il prompt di sistema (con le regole del formato e 3 esempi astratti) + la richiesta utente, e chiama l'LLM con `with_structured_output(ExecutionPlan, method="json_schema", include_raw=True)`.
 * **Output:** un oggetto Pydantic gerarchico `ExecutionPlan` immutabile:
   ```json
@@ -185,8 +186,8 @@ Ora entra in scena il `Planner` (`planner/planner.py`). È il **primo modulo che
         "description": "Compute Italy's population density",
         "inputs": {
           "operation": "divide",
-          "a": {"task_id": "task_1", "output_path": "population"},
-          "b": {"task_id": "task_1", "output_path": "area_km2"}
+          "a": {"task_id": "task_1", "output_path": ["population"]},
+          "b": {"task_id": "task_1", "output_path": ["area_km2"]}
         }
       },
       {
@@ -195,8 +196,8 @@ Ora entra in scena il `Planner` (`planner/planner.py`). È il **primo modulo che
         "description": "Calculate population difference (Italy - Atlantis)",
         "inputs": {
           "operation": "subtract",
-          "a": {"task_id": "task_1", "output_path": "population"},
-          "b": {"task_id": "task_2", "output_path": "population"}
+          "a": {"task_id": "task_1", "output_path": ["population"]},
+          "b": {"task_id": "task_2", "output_path": ["population"]}
         }
       }
     ]
@@ -282,14 +283,17 @@ Il `Joiner` (`joiner/joiner.py`) trasforma i dati tecnici grezzi dell'`Executor`
 * **Input:**
   * `request: str` (la richiesta originale dell'utente, necessaria per la lingua e il contesto);
   * `execution_result: ExecutionResult` (prodotto dall'`Executor`);
-  * `plan: ExecutionPlan | None` (opzionale, per usare le descrizioni umane `task.description` al posto dei nomi grezzi dei tool).
+  * `plan: ExecutionPlan | None` (opzionale, per usare le descrizioni umane `task.description` al posto dei nomi grezzi dei tool);
+  * *(solo in v3)* `prior_rounds: Sequence[ExecutionRound]`, `tool_catalog: Mapping[str, str] | None` e `allow_replan: bool`.
 * **Cosa fa:**
-  1. **Parte deterministica:** calcola `status` (`"complete"` / `"partial"` / `"failed"`) e costruisce `missing_information` ordinato topologicamente.
-  2. **Parte LLM (LLM #2):** invoca l'LLM con `with_structured_output(JoinerOutput)` chiedendogli *soltanto* `answer: str`, ancorato ai soli task `success`, nella lingua della richiesta e senza esporre ID interni come `task_3`.
+  1. **Parte deterministica:** calcola `status` (`"complete"` / `"partial"` / `"failed"`) considerando anche eventuali `prior_rounds` e costruisce `missing_information` ordinato topologicamente.
+  2. **Parte LLM (LLM #2):** quando `allow_replan=False` invoca l'LLM con `with_structured_output(JoinerOutput)` chiedendogli *soltanto* `answer: str`; quando `allow_replan=True` usa `JoinerDecisionOutput` (`action: "finish" | "replan"`, `answer`, `replan_reason`) passando anche `tool_catalog` per capire se un errore runtime è recuperabile.
 * **Output:** un oggetto `JoinerResult` immutabile:
   ```json
   {
+    "action": "finish",
     "status": "partial",
+    "replan_reason": null,
     "missing_information": [
       "Get stats for Atlantis — error (ValueError): Country 'Atlantis' not found in dataset.",
       "Calculate population difference (Italy - Atlantis) — skipped: Skipped because upstream task 'task_2' failed."
@@ -339,9 +343,9 @@ In `src/langgraph_llm_compiler/planner/schemas.py`, ogni task è definito da `Ta
 * `inputs: dict[str, TaskInputValue]` dove:
   ```python
   class InputBinding(BaseModel):
-      model_config = ConfigDict(frozen=True, extra="forbid")
+      model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
       task_id: NonEmptyStr
-      output_path: NonEmptyStr
+      output_path: list[NonEmptyStr] = Field(default_factory=list)
 
   TaskInputValue = Annotated[InputBinding | Any, Field(union_mode="left_to_right")]
   ```
@@ -403,7 +407,7 @@ Le regole verificate in singola passata da `PlanCompiler` sono:
 | `missing_dependency` | Esistenza di ogni `task_id` referenziato da un `InputBinding`. |
 | `cycle_detected` | Assenza di cicli nel grafo delle dipendenze, con ricostruzione esplicita del percorso del ciclo (es. `task_1 -> task_2 -> task_1`). |
 | `missing_required_argument` / `unknown_argument` / `invalid_static_argument` | Validazione statica dei parametri contro `ToolSpec.input_schema` (verificando anche gli enum `Literal` e i tipi dei valori statici, pur ignorando momentaneamente i campi che arriveranno via binding a runtime). |
-| `invalid_output_path` | Attraversamento ricorsivo del percorso punteggiato (es. `economy.gdp.nominal_billion_usd`) lungo la gerarchia di modelli Pydantic dell'`output_schema` del task upstream. |
+| `invalid_output_path` | Attraversamento ricorsivo della sequenza di chiavi `output_path` (es. `["economy", "gdp", "nominal_billion_usd"]`) lungo la gerarchia di modelli Pydantic dell'`output_schema` del task upstream. |
 
 Se non emerge alcuna issue, il compilatore esegue l'**algoritmo di Kahn** (ordinamento topologico con calcolo dei livelli *ASAP — As Soon As Possible*) e costruisce un `CompiledDAG` completamente **immutabile** (`frozen=True` + `MappingProxyType` per tutte le mappe interne) che espone:
 * `topological_order`: sequenza deterministica dei task;
@@ -632,7 +636,7 @@ Report: `results/hard_suite_v1_vs_v2_20261119T221908Z.json` (`reasoning=False`) 
 
 Poiché la suite da 4 tool era saturata al 100%, per misurare l'impatto reale del **compile-time self-correction (v2)** abbiamo progettato una **Hard Suite** realistica composta da:
 * **10 tool totali**: 6 strumenti di dominio (`macro_profile`, `energy_profile`, `fx_quote`, `tax_estimator`, `math_op`, `pct_diff`) + **4 distrattori plausibili** (`weather_forecast`, `stock_quote`, `timezone_offset`, `unit_convert`) progettati per indurre scelte errate di tool;
-* **Output annidati fino a 3 livelli** (es. `economy.gdp.nominal_billion_usd`, `demographics.population_millions`, `metrics.renewable_share_pct`);
+* **Output annidati fino a 3 livelli** (es. `["economy", "gdp", "nominal_billion_usd"]`, `["demographics", "population_millions"]`, `["metrics", "renewable_share_pct"]`);
 * **Enum stretti** (`op: 'add'|'sub'|'mul'|'div'`, `country_code: 'IT'|'DE'|'FR'|'ES'|'JP'`);
 * **6 query complesse (`h01`–`h06`)** verificate da un **grader numerico automatico** (che controlla la presenza di tutti i valori attesi entro tolleranza di arrotondamento nella risposta finale del Joiner).
 
@@ -653,7 +657,7 @@ Poiché la suite da 4 tool era saturata al 100%, per misurare l'impatto reale de
   * a `reasoning=True`, al tentativo 1 il modello aveva addirittura allucinato tre tool inesistenti (`algebraic_manipulation`, `arithmetic_operations`, `division`); **v2** lo ha riportato sui binari giusti al retry 1 (`9` nodi, `4` livelli, `speedup 2.51x`).
 * **`h03_renewable_twh_groups` (il limite strutturale della validazione statica vs DAG da 14 nodi)**:
   * a `reasoning=False`, il piano compilava al primo colpo (10 nodi, 3 livelli, `speedup 2.64x`), ma conteneva un **errore logico puro**: moltiplicava `total_twh * renewable_share_pct` dimenticando `/ 100` (ottenendo `25,275 TWh` invece di `252.75 TWh`). Poiché tutti i tipi erano validi (`float * float`), un compilatore statico *non può* rilevare questo errore.
-  * a `reasoning=True` + **v2**, il modello ha impostato la formula corretta con `/ 100` in un DAG da **14 nodi su 4 livelli** (`speedup 2.78x`): al tentativo 1 mancavano alcuni campi `op`/`country`, al retry 1 aveva usato `output_path="result"` invece di `"value"` su `math_op`, e al **retry 2** ha riparato tutto ottenendo i risultati esatti al centesimo (`252.75 TWh` e `393.9 TWh`).
+  * a `reasoning=True` + **v2**, il modello ha impostato la formula corretta con `/ 100` in un DAG da **14 nodi su 4 livelli** (`speedup 2.78x`): al tentativo 1 mancavano alcuni campi `op`/`country`, al retry 1 aveva usato `output_path=["result"]` invece di `["value"]` su `math_op`, e al **retry 2** ha riparato tutto ottenendo i risultati esatti al centesimo (`252.75 TWh` e `393.9 TWh`).
 * **`h04_tax_fx_chain` (*fixation bias* vs *runaway thinking loop*)**:
   * a `reasoning=False`, vedendo il distrattore `unit_convert` nel `previous_plan`, il modello ha mostrato un fenomeno di **fixation bias**, riproponendo `unit_convert` su tutti e 3 i tentativi finché `max_compile_retries=2` non ha fermato il grafo in modo pulito (`14.38 s`).
   * a `reasoning=True`, in **v1** il modello è caduto in un *runaway thinking loop* da **`445.99 s`** terminato con `PlannerOutputError` (output troncato); in **v2**, dopo un singolo `invalid_output_path` (`'value'` su `fx_quote`), ha recuperato al retry 1 in `28.31 s` producendo tutti e 4 i numeri esatti (`184000`, `114080`, `104880`, `9200`).
@@ -761,7 +765,7 @@ Per valutare in modo rigoroso e imparziale (**apples-to-apples**) la nostra arch
    * Perché su Ollama locale ReAct è comunque più rapido in wall-clock (`7.04 s` vs `12.08 s` su `IO_HEAVY`, `4.05 s` vs `13.51 s` su `STANDARD`)? Perché i `14,116` token di **input** di ReAct vengono serviti quasi istantaneamente dalla **KV-cache / prefill** locale, mentre i `+1,571` token extra di **output** JSON del nostro `ExecutionPlan` (`2,894` vs `1,323`) pagano la velocità di *decode* della GPU locale.
    * **Quando conviene ciascuna architettura**:
      * **LangGraph ReAct** è ideale su GPU locale con tool veloci (< 200 ms), poche dipendenze concatenate e modelli che supportano *native parallel tool calling*.
-     * **LLM Compiler v3** è superiore quando servono **garanzie formali / auditabilità del DAG prima dell'esecuzione** (zero calcoli inventati a mente), su **catene API multi-hop lente (1–5 s)** o su **LLM cloud** dove risparmiare **3 round-trip sequenziali (TTFT)** e **28–35% di token** abbatte sia i costi sia la latenza end-to-end.
+     * **LLM Compiler v3** è superiore quando servono **garanzie formali / auditabilità del DAG prima dell'esecuzione** (zero calcoli inventati a mente), su **catene API multi-hop lente (`>= 3.5 s` in locale, come dimostrato sotto)** o su **LLM cloud** dove risparmiare **3 round-trip sequenziali (TTFT)** e **28–35% di token** abbatte sia i costi sia la latenza end-to-end.
 4. **Lezione operativa su `num_predict`**: un run preliminare senza cap aveva mostrato un raro loop di generazione su `c06` (`8,552` output token); l'introduzione di `num_predict=2048` in `llm.py` insieme al rafforzamento della regola anti-replan su errori *does not exist* ha portato `c06` a `EXACT` con `0` replan sprecati.
 
 #### Curva di crossover I/O: quando LLM Compiler batte ReAct *anche* in latenza wall-clock
