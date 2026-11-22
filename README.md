@@ -1,8 +1,8 @@
 # langgraph-llm-compiler
 
-Implementazione modulare, verificata formalmente e benchmarkabile dell'architettura **LLM Compiler** con orchestrazione stateful tramite **LangGraph** e supporto a modelli locali via **Ollama** (testata end-to-end con `qwen3:8b`).
+Implementazione modulare, verificata formalmente e benchmarkabile dell'architettura **LLM Compiler**, con una **separazione netta tra core framework-agnostic (`llm_compiler`, zero import da `langgraph`)** e **adattatori stateful opzionali per LangGraph (`langgraph_adapters`)**, oltre al supporto a modelli locali via **Ollama** (testata end-to-end con `qwen3:8b`).
 
-Il progetto è progettato con tre obiettivi primari: **correttezza formale** (contratti di input/output validati staticamente e a runtime), **riproducibilità** (suite di test unitari deterministiche e benchmark salvati in JSON) e **valutazione sperimentale comparativa** (latenza, parallelismo effettivo, speedup misurato rispetto a baseline sequenziali, affidabilità e confronti tra motori di scheduling e configurazioni LLM).
+Il progetto è progettato con tre obiettivi primari: **correttezza formale** (contratti di input/output validati staticamente e a runtime), **riproducibilità** (suite di 93 test unitari deterministici e benchmark salvati in JSON) e **valutazione sperimentale comparativa** (latenza, parallelismo effettivo, speedup misurato rispetto a baseline sequenziali, affidabilità e confronti tra motori di scheduling, orchestratori e architetture agentiche).
 
 ---
 
@@ -15,7 +15,7 @@ Il progetto è progettato con tre obiettivi primari: **correttezza formale** (co
    - [2.3 Modulo 2 — `PlanCompiler` (dal piano non fidato al `CompiledDAG` certificato)](#23-modulo-2--plancompiler-dal-piano-non-fidato-al-compileddag-certificato)
    - [2.4 Modulo 3 — `Executor` (dal `CompiledDAG` all'esecuzione parallela)](#24-modulo-3--executor-dal-compileddag-allesecuzione-parallela)
    - [2.5 Modulo 4 — `Joiner` (dai risultati tecnici alla risposta finale)](#25-modulo-4--joiner-dai-risultati-tecnici-alla-risposta-finale)
-   - [2.6 Modulo 5 — `graph` / LangGraph (il coordinatore sopra ai moduli)](#26-modulo-5--graph--langgraph-il-coordinatore-sopra-ai-moduli)
+   - [2.6 Modulo 5 — Orchestrazione (`llm_compiler.workflow` vs `langgraph_adapters`)](#26-modulo-5--orchestrazione-llm_compilerworkflow-vs-langgraph_adapters)
 3. [Scelte architetturali e funzionamento interno (in dettaglio)](#3-scelte-architetturali-e-funzionamento-interno-in-dettaglio)
    - [3.1 Schema unificato `inputs` e dipendenze implicite (Strada A)](#31-schema-unificato-inputs-e-dipendenze-implicite-strada-a)
    - [3.2 `ToolRegistry` come unica *source of truth*](#32-toolregistry-come-unica-source-of-truth)
@@ -23,10 +23,10 @@ Il progetto è progettato con tre obiettivi primari: **correttezza formale** (co
    - [3.4 Scheduler `asyncio` event-driven vs LangGraph `StateGraph` dinamico (Pregel BSP)](#34-scheduler-asyncio-event-driven-vs-langgraph-stategraph-dinamico-pregel-bsp)
    - [3.5 Esecuzione best-effort, propagazione `SKIPPED` e telemetria serializzabile](#35-esecuzione-best-effort-propagazione-skipped-e-telemetria-serializzabile)
    - [3.6 Separazione deterministica nel `Joiner` (`JoinerOutput` / `JoinerDecisionOutput` vs `JoinerResult`)](#36-separazione-deterministica-nel-joiner-joineroutput--joinerdecisionoutput-vs-joinerresult)
-   - [3.7 Orchestrazione macro con LangGraph: v1 lineare, v2 compile-time self-correction e v3 runtime replanning](#37-orchestrazione-macro-con-langgraph-v1-lineare-v2-compile-time-self-correction-e-v3-runtime-replanning)
+   - [3.7 Orchestrazione macro: runner pure-Python vs LangGraph (`v1`, `v2`, `v3` e scorciatoia `tasks=[]`)](#37-orchestrazione-macro-runner-pure-python-vs-langgraph-v1-v2-v3-e-scorciatoia-tasks)
    - [3.8 Rigore metodologico delle metriche](#38-rigore-metodologico-delle-metriche)
 4. [Risultati sperimentali e analisi critica](#4-risultati-sperimentali-e-analisi-critica)
-   - [4.1 Overhead puro di orchestrazione LangGraph](#41-overhead-puro-di-orchestrazione-langgraph)
+   - [4.1 Overhead puro di orchestrazione: `run_compiler_workflow` vs LangGraph `StateGraph`](#41-overhead-puro-di-orchestrazione-run_compiler_workflow-vs-langgraph-stategraph)
    - [4.2 Baseline v1 su suite standard (4 tool, 8 query)](#42-baseline-v1-su-suite-standard-4-tool-8-query)
    - [4.3 Benchmark deterministico di scheduling (Event-driven vs Pregel BSP)](#43-benchmark-deterministico-di-scheduling-event-driven-vs-pregel-bsp)
    - [4.4 Hard Suite 10 tool: matrice 2x2 (v1 vs v2 e reasoning)](#44-hard-suite-10-tool-matrice-2x2-v1-vs-v2-e-reasoning)
@@ -74,32 +74,36 @@ Nel caso felice, anche un workflow con 10–15 chiamate a strumenti viene risolt
 
 ## 2. Architettura completa e passaggio di testimone tra moduli indipendenti
 
-Una delle scelte progettuali più importanti di questo repository è che **ogni modulo è completamente separato e autosufficiente**: ognuno ha un solo compito, un contratto di input/output tipizzato, una propria suite di test unitari dedicata e **non conosce i dettagli interni degli altri moduli**.
+Una delle scelte progettuali più importanti di questo repository è che **ogni modulo è completamente separato e autosufficiente**, e l'intero core **`llm_compiler`** è **100% agnostico rispetto a LangGraph** (zero import da `langgraph`, verificati automaticamente via AST in `tests/test_architecture_boundaries.py`).
 
-Puoi usare `Planner` da solo per generare piani, `PlanCompiler` da solo per validare un piano scritto a mano, `Executor` da solo su un `CompiledDAG` senza nessun LLM e senza LangGraph, o collegarli tutti tramite il modulo `graph`.
+Puoi usare `Planner` da solo per generare piani, `PlanCompiler` da solo per validare un piano scritto a mano, `Executor` da solo su un `CompiledDAG` senza nessun LLM, orchestrare l'intera pipeline in Python puro con `llm_compiler.run_compiler_workflow(...)`, oppure montare gli stessi identici step dentro lo `StateGraph` opzionale di `langgraph_adapters.compiler_graph`.
 
 ```mermaid
 flowchart LR
     R["ToolRegistry"] -->|catalogo prompt| P["Planner (LLM)"]
     P -->|ExecutionPlan| C["PlanCompiler"]
+    P -. "tasks=[] (direct)" .-> J["Joiner (LLM + stato deterministico)"]
     R -->|contratti I/O| C
     C -->|CompiledDAG| E["Executor (asyncio event-driven)"]
     R -->|handler + schemi| E
-    E -->|ExecutionResult| J["Joiner (LLM + stato deterministico)"]
+    E -->|ExecutionResult| J
     C -. "v2: CompilationIssue + previous_plan" .-> P
     J -. "v3: replan_context + execution_history" .-> P
 ```
 
-### Riepilogo dei moduli
+### Riepilogo dei pacchetti e moduli
 
-| Modulo | File principali | Usa LLM? | Stato | Responsabilità unica |
+| Pacchetto / Modulo | File principali | Usa LLM? | Dipende da LangGraph? | Responsabilità unica |
 | :--- | :--- | :---: | :---: | :--- |
-| `ToolRegistry` (`compiler/registry.py`) | `registry.py` | No | Implementato | Custodisce i `ToolSpec` (funzioni + schemi Pydantic I/O) e genera il catalogo per il Planner. |
-| `planner` | `schemas.py`, `planner.py` | **Sì** | Implementato (v3) | Trasforma la richiesta testuale (con eventuale `feedback` v2 e/o `replan_context` v3) in un `ExecutionPlan` sintatticamente valido. |
-| `compiler` | `dag.py`, `compiler.py` | No | Implementato | Verifica staticamente tutte le regole semantiche del piano e produce un `CompiledDAG` immutabile (o tutte le `CompilationIssue`). |
-| `executor` | `results.py`, `bindings.py`, `executor.py` | No | Implementato | Esegue il `CompiledDAG` in parallelo con scheduler `asyncio` event-driven e produce `ExecutionResult`. |
-| `joiner` | `schemas.py`, `joiner.py` | **Sì** + codice | Implementato (v3) | Sintetizza `answer` (`finish`) oppure chiede un follow-up (`replan` con `replan_reason`), calcolando deterministicamente `status` e `missing_information` (`JoinerResult`). |
-| `graph` | `state.py`, `nodes.py`, `builder.py` | No (orchestrazione) | Implementato (v3) | Collega i moduli in uno `StateGraph` LangGraph con compile retry v2 (`compiler -> planner`), runtime replan v3 (`joiner -> planner`) e degradazione controllata. |
+| `llm_compiler.compiler` (`ToolRegistry`) | `registry.py` | No | **No** | Custodisce i `ToolSpec` (funzioni + schemi Pydantic I/O) e genera il catalogo per il Planner. |
+| `llm_compiler.tools` | `python_sandbox.py` | No | **No** | Tool condivisi *architecture-neutral* (es. `run_python_code` validato via AST) riutilizzabili sia nel Compiler sia in ReAct. |
+| `llm_compiler.planner` | `schemas.py`, `planner.py` | **Sì** | **No** | Trasforma la richiesta testuale (con eventuale `feedback` v2 e/o `replan_context` v3) in un `ExecutionPlan` sintatticamente valido (o `tasks=[]` per risposte dirette). |
+| `llm_compiler.compiler` (`PlanCompiler`) | `dag.py`, `compiler.py` | No | **No** | Verifica staticamente tutte le regole semantiche del piano e produce un `CompiledDAG` immutabile (o tutte le `CompilationIssue`). |
+| `llm_compiler.executor` | `results.py`, `bindings.py`, `executor.py` | No | **No** | Esegue il `CompiledDAG` in parallelo con scheduler `asyncio` event-driven e produce `ExecutionResult`. |
+| `llm_compiler.joiner` | `schemas.py`, `joiner.py` | **Sì** + codice | **No** | Sintetizza `answer` (`finish` / `join_direct`) oppure chiede un follow-up (`replan` con `replan_reason`), calcolando deterministicamente `status` e `missing_information` (`JoinerResult`). |
+| `llm_compiler` (`state`, `steps`, `workflow`) | `state.py`, `steps.py`, `workflow.py` | No (orchestrazione) | **No** | Stato `CompilerState`, 4 step async riutilizzabili (`make_*_step`) e runner pure-Python `run_compiler_workflow` (v1/v2/v3 + scorciatoia `tasks=[]`). |
+| `langgraph_adapters.compiler_graph` | `builder.py` | No (adattatore) | **Sì** | Avvolge gli stessi identici step di `llm_compiler.steps` in uno `StateGraph` LangGraph (streaming `astream`, export Mermaid/PNG, future persistenza/HITL). |
+| `langgraph_adapters.react_graph` | `state.py`, `tools.py`, `builder.py` | **Sì** (agente) | **Sì** | Baseline modulare **LangGraph ReAct** costruito sullo stesso `ToolRegistry`, con `ToolNode` parallelo, timeout per tool e validazione Pydantic I/O. |
 
 ---
 
@@ -204,7 +208,7 @@ Ora entra in scena il `Planner` (`planner/planner.py`). È il **primo modulo che
   }
   ```
 * **Garanzie offerte a valle:**
-  * **Solo garanzie sintattiche/strutturali** (fornite da Pydantic): il risultato è un `ExecutionPlan` ben formato, immutabile (`frozen=True`), con `objective` e `tasks` non vuoti, nessun campo extra sconosciuto, e i binding ben formati già convertiti in oggetti `InputBinding(task_id, output_path)`.
+  * **Solo garanzie sintattiche/strutturali** (fornite da Pydantic): il risultato è un `ExecutionPlan` ben formato, immutabile (`frozen=True`), con `objective` non vuoto, nessun campo extra sconosciuto, e i binding ben formati già convertiti in oggetti `InputBinding(task_id, output_path)`. Se la richiesta non richiede alcun tool (es. conversazione diretta o informazione già nota), il Planner può emettere `tasks=[]` attivando la scorciatoia verso `Joiner.join_direct(...)`.
   * Se l'LLM produce JSON rotto o fuori schema, il modulo solleva `PlannerOutputError` allegando `raw_output`.
 * **Fine della responsabilità:** il `Planner` **non garantisce** che i `tool_name` esistano davvero, che gli argomenti siano del tipo giusto, che gli `output_path` esistano o che non ci siano cicli tra task. Ha tradotto l'intenzione umana in una proposta di piano strutturata: la sua responsabilità finisce qui e passa il testimone al **`PlanCompiler`**.
 
@@ -311,12 +315,16 @@ Il `Joiner` (`joiner/joiner.py`) trasforma i dati tecnici grezzi dell'`Executor`
 
 ---
 
-### 2.6 Modulo 5 — `graph` / LangGraph (il coordinatore sopra ai moduli)
+### 2.6 Modulo 5 — Orchestrazione (`llm_compiler.workflow` vs `langgraph_adapters`)
 
-Infine, il modulo `graph` (`graph/state.py`, `graph/nodes.py`, `graph/builder.py`) **non re-implementa nessuna logica** dei moduli precedenti: li avvolge in 4 nodi sottili dentro uno `StateGraph` di LangGraph.
+Lo strato di orchestrazione **non re-implementa nessuna logica** dei moduli core: i 4 step asincroni sottili vivono in `llm_compiler/steps.py` (`make_planner_step`, `make_compiler_step`, `make_executor_step`, `make_joiner_step`) insieme allo stato `CompilerState` (`llm_compiler/state.py`), e vengono condivisi da **due orchestratori 100% intercambiabili**:
 
-* **Input:** lo stato iniziale `{"request": "..."}` passato a `await graph.ainvoke(...)` o `graph.astream(...)`.
-* **Cosa fa:** gestisce il passaggio di stato (`CompilerState`) da un modulo all'altro, cronometra ogni fase in `WorkflowMetrics`, intercetta eventuali errori applicativi in `WorkflowError` e governa entrambi i cicli di controllo:
+1. **Runner pure-Python (`llm_compiler/workflow.py`)**: `await run_compiler_workflow(request, ...)` esegue il ciclo di stato (`v1`, `v2`, `v3`, Graceful Degradation e scorciatoia `tasks=[]`) in ~100 righe di Python puro, con **zero dipendenza da LangGraph**.
+2. **Adattatore LangGraph (`langgraph_adapters/compiler_graph/builder.py`)**: `build_compiler_graph(...)` monta esattamente gli stessi 4 step in uno `StateGraph` di LangGraph per aggiungere le primitive del framework (`astream` evento-per-evento, export Mermaid/PNG, predisposizione a checkpointer/Human-in-the-Loop e interfaccia identica a `langgraph_adapters.react_graph`).
+
+* **Input:** `request` (per `run_compiler_workflow`) oppure lo stato iniziale `{"request": "..."}` passato a `await graph.ainvoke(...)` / `graph.astream(...)`.
+* **Cosa fa:** gestisce il passaggio di stato (`CompilerState`) da un modulo all'altro, cronometra ogni fase in `WorkflowMetrics`, intercetta eventuali errori applicativi in `WorkflowError` e governa tutte le transizioni:
+  * **Scorciatoia diretta (`tasks == []`)**: bypassa `compiler` ed `executor` andando direttamente a `Joiner.join_direct(...)` (o finalizzando dai round precedenti se avviene in un replan v3);
   * **v2 (`max_compile_retries > 0`)**: ciclo `compiler -> planner` quando `PlanCompiler` boccia un piano;
   * **v3 (`max_replans > 0`)**: ciclo `joiner -> planner` quando `Joiner` chiede un replan runtime, archiviando ogni round in `execution_history` e applicando *Graceful Degradation* se un round di replan fallisce prima dell'esecuzione.
 * **Output:** lo stato finale `CompilerState` completo di:
@@ -324,10 +332,14 @@ Infine, il modulo `graph` (`graph/state.py`, `graph/nodes.py`, `graph/builder.py
   * `error` (eventuale `WorkflowError` fatale), `replan_error` (eventuale guasto non fatale di un round di replan recuperato via fallback), `compile_error_history`;
   * `metrics` (`planning_latency_ms`, `compilation_latency_ms`, `execution_latency_ms`, `joining_latency_ms`, `llm_calls`, `compile_attempts`, `compile_retries`, `replan_attempts`, `plan_valid`, `component_latency_ms`).
 * **Garanzie offerte a valle:**
-  * Terminazione garantita (grazie ai budget separati `max_compile_retries` per round e `max_replans` globale), proprietà di sicurezza monotonica (un replan fallito non distrugge mai risultati già ottenuti al Round 1), osservabilità step-by-step via `astream`, e separazione netta tra logica dei componenti e orchestrazione del flusso.
+  * Terminazione garantita (grazie ai budget separati `max_compile_retries` per round e `max_replans` globale), proprietà di sicurezza monotonica (un replan fallito non distrugge mai risultati già ottenuti al Round 1), parità comportamentale esatta tra runner pure-Python e `StateGraph`, e confine architetturale verificato automaticamente da `tests/test_architecture_boundaries.py`.
 
 > **In parole semplici:**
-> Il modulo `graph` è il **nastro trasportatore intelligente** (con un supervisore) che collega le postazioni di lavoro descritte sopra: prende la scatola prodotta da un reparto, cronometra quanto ci ha messo, la passa al reparto successivo e gestisce sia i ritorni dell'ispettore (`PlanCompiler` → `Planner`, v2) sia i giri extra richiesti dal portavoce dopo aver visto i risultati reali (`Joiner` → `Planner`, v3). Se un giro extra dovesse andare storto, il supervisore non butta mai via il lavoro buono già fatto al primo giro. E se un giorno vuoi sostituire LangGraph con un altro orchestratore, tutti i moduli sotto (`ToolRegistry`, `Planner`, `PlanCompiler`, `Executor`, `Joiner`) continuano a funzionare esattamente allo stesso modo senza cambiare una riga.
+> Immagina i 4 reparti descritti sopra collegati da un **nastro trasportatore intelligente** (`steps.py` + `state.py`). Ora puoi azionare quel nastro con **due motori identici negli effetti**:
+> * **`run_compiler_workflow` (Python puro)** è il motore minimalista "zero fronzoli": non ha bisogno di LangGraph e fa esattamente gli stessi giri in meno di un millisecondo.
+> * **`langgraph_adapters` (`StateGraph`)** è lo stesso identico nastro montato su una plancia di comando LangGraph: costa ~0.35 millisecondi a passaggio, ma ti regala lo streaming live passo-passo (`astream`), i diagrammi grafici automatici e la compatibilità pronta per salvataggi/pause/ripresa e confronti diretti con ReAct.
+>
+> La prova più forte della pulizia architetturale? Il cuore del progetto (`src/llm_compiler/`) ha **zero import da `langgraph`**: puoi portarlo in qualsiasi altro framework o servizio senza cambiare una sola riga.
 
 ---
 
@@ -335,7 +347,7 @@ Infine, il modulo `graph` (`graph/state.py`, `graph/nodes.py`, `graph/builder.py
 
 ### 3.1 Schema unificato `inputs` e dipendenze implicite (Strada A)
 
-In `src/langgraph_llm_compiler/planner/schemas.py`, ogni task è definito da `TaskSpec`:
+In `src/llm_compiler/planner/schemas.py`, ogni task è definito da `TaskSpec`:
 
 * `task_id: NonEmptyStr`
 * `tool_name: NonEmptyStr`
@@ -368,7 +380,7 @@ Tutti i modelli hanno `frozen=True` (immutabili) e `extra="forbid"` (rifiutano c
 
 ### 3.2 `ToolRegistry` come unica *source of truth*
 
-In `src/langgraph_llm_compiler/compiler/registry.py`, ogni strumento viene registrato una sola volta come `ToolSpec`:
+In `src/llm_compiler/compiler/registry.py`, ogni strumento viene registrato una sola volta come `ToolSpec`:
 
 ```python
 ToolSpec(
@@ -424,7 +436,7 @@ Se non emerge alcuna issue, il compilatore esegue l'**algoritmo di Kahn** (ordin
 
 ### 3.4 Scheduler `asyncio` event-driven vs LangGraph `StateGraph` dinamico (Pregel BSP)
 
-Una scelta architetturale fondamentale del progetto è mantenere l'`Executor` (`src/langgraph_llm_compiler/executor/executor.py`) **completamente indipendente da LangGraph**, eseguendo il `CompiledDAG` tramite uno scheduler **event-driven con ready-queue** in `asyncio`:
+Una scelta architetturale fondamentale del progetto è mantenere l'`Executor` (`src/llm_compiler/executor/executor.py`) **completamente indipendente da LangGraph**, eseguendo il `CompiledDAG` tramite uno scheduler **event-driven con ready-queue** in `asyncio`:
 
 1. Tutti i `root_tasks` entrano subito nella `ready_queue`.
 2. Finché ci sono task in `ready_queue` e slot liberi rispetto a `max_concurrency` (default `8`; `None` per concorrenza illimitata; `1` per ottenere una **baseline sequenziale equa** sullo stesso codice), lo scheduler avvia `asyncio.create_task(...)`.
@@ -476,7 +488,7 @@ Executor Event-driven (402 ms):
 
 ### 3.5 Esecuzione best-effort, propagazione `SKIPPED` e telemetria serializzabile
 
-In `src/langgraph_llm_compiler/executor/results.py` e `executor.py`, ogni task produce un `TaskExecutionResult` immutabile (`frozen=True`):
+In `src/llm_compiler/executor/results.py` e `executor.py`, ogni task produce un `TaskExecutionResult` immutabile (`frozen=True`):
 
 * `status`: `"success" | "error" | "skipped"`
 * `output`: payload validato tramite `ToolSpec.output_schema` (solo se `success`)
@@ -501,7 +513,7 @@ In `src/langgraph_llm_compiler/executor/results.py` e `executor.py`, ogni task p
 
 ### 3.6 Separazione deterministica nel `Joiner` (`JoinerOutput` / `JoinerDecisionOutput` vs `JoinerResult`)
 
-In `src/langgraph_llm_compiler/joiner/`, separiamo nettamente ciò che è **generativo** da ciò che è **deterministico**, usando un **doppio schema adattivo** per garantire zero overhead quando il replanning non è attivo:
+In `src/llm_compiler/joiner/`, separiamo nettamente ciò che è **generativo** da ciò che è **deterministico**, usando un **doppio schema adattivo** per garantire zero overhead quando il replanning non è attivo:
 
 * **Modalità sintesi (`allow_replan=False`, v1/v2 o ultimo giro del budget v3)**: l'LLM usa lo schema leggero `JoinerOutput(answer)` e genera *unicamente* il testo finale seguendo 4 regole:
   1. **Lingua**: rispondere nella stessa lingua della richiesta utente originale.
@@ -523,16 +535,20 @@ In `src/langgraph_llm_compiler/joiner/`, separiamo nettamente ciò che è **gene
 
 ---
 
-### 3.7 Orchestrazione macro con LangGraph: v1 lineare, v2 compile-time self-correction e v3 runtime replanning
+### 3.7 Orchestrazione macro: runner pure-Python vs LangGraph (`v1`, `v2`, `v3` e scorciatoia `tasks=[]`)
 
-LangGraph viene usato **esclusivamente al livello di orchestrazione macro stateful** (`src/langgraph_llm_compiler/graph/`), dove brillano i suoi punti di forza: gestione pulita dei cicli di controllo tramite conditional edges, stato condiviso tipizzato (`CompilerState`), streaming passo-passo (`astream`) e interfaccia uniforme per confrontare la nostra architettura con altri agenti (es. ReAct).
+Una scelta chiave dell'architettura è **disaccoppiare la macchina a stati dell'LLM Compiler dal framework che la esegue**:
+
+* Tutto il core (`src/llm_compiler/`) — inclusi `state.py` (`CompilerState`, `WorkflowMetrics`, `WorkflowError`), `steps.py` (i 4 step asincroni `make_*_step`) e `workflow.py` (`run_compiler_workflow`) — **non importa mai `langgraph`** (confine protetto da `tests/test_architecture_boundaries.py`).
+* **LangGraph** è confinato interamente in `src/langgraph_adapters/` (`compiler_graph/builder.py` e `react_graph/`), dove brilla per ciò che aggiunge *sopra* agli step: streaming evento-per-evento (`astream`), export grafico Mermaid/PNG, predisposizione a checkpointer/pause/Human-in-the-Loop e interfaccia uniforme per confrontare la nostra architettura con `react_graph`.
 
 ```mermaid
 flowchart TD
     START(["START"]) --> P["planner"]
-    P -->|"ExecutionPlan OK"| C["compiler"]
+    P -->|"ExecutionPlan OK (tasks > 0)"| C["compiler"]
+    P -->|"ExecutionPlan OK (tasks == [] — direct)"| J["joiner"]
     P -->|"Errore (Round 1)"| END_ERR(["END (failed)"])
-    P -. "v3: errore Round 2+ (Graceful Degradation)" .-> J["joiner"]
+    P -. "v3: errore Round 2+ (Graceful Degradation)" .-> J
     C -->|"CompiledDAG OK"| E["executor"]
     C -->|"v2: PlanCompilationError & round_attempts <= max"| P
     C -->|"Budget compile esaurito (Round 1)"| END_ERR
@@ -543,24 +559,29 @@ flowchart TD
     J -. "v3: action == 'replan' & replan_attempts < max" .-> P
 ```
 
-Dettagli chiave dell'implementazione in `graph/state.py`, `graph/nodes.py` e `graph/builder.py`:
+Dettagli chiave condivisi tra `llm_compiler/state.py`, `llm_compiler/steps.py`, `llm_compiler/workflow.py` e `langgraph_adapters/compiler_graph/builder.py`:
 
-* **4 nodi async sottili (`nodes.py`)**: ciascun nodo wrappa il proprio componente core (`Planner`, `PlanCompiler`, `Executor`, `Joiner`) misurandone la latenza cumulativa via `time.perf_counter()`, aggiornando `WorkflowMetrics` e intercettando eccezioni applicative in `WorkflowError` (preservando però esplicitamente `asyncio.CancelledError`).
-* **Progressione retrocompatibile `v1 -> v2 -> v3`**: `build_compiler_graph(..., max_compile_retries: int = 0, max_replans: int = 0)` espone solo gli archi necessari:
-  * **`v1` (`0, 0`)**: grafo puramente lineare con uscite anticipate su errore.
+* **4 step async sottili e agnostici (`llm_compiler/steps.py`)**: ciascuno step (`make_planner_step`, `make_compiler_step`, `make_executor_step`, `make_joiner_step`) wrappa il proprio componente core misurandone la latenza cumulativa via `time.perf_counter()`, aggiornando `WorkflowMetrics` e intercettando eccezioni applicative in `WorkflowError` (preservando però esplicitamente `asyncio.CancelledError`).
+* **Scorciatoia empty-plan (`tasks == []`)**: se la richiesta non richiede l'uso di alcun tool, il `Planner` può restituire un piano vuoto e l'orchestratore salta `compiler` ed `executor` invocando direttamente `Joiner.join_direct(...)` (oppure finalizzando dai round già completati se accade in un replan v3).
+* **Progressione retrocompatibile `v1 -> v2 -> v3`**: sia `run_compiler_workflow(..., max_compile_retries=0, max_replans=0)` sia `build_compiler_graph(..., max_compile_retries=0, max_replans=0)` espongono esattamente le stesse modalità:
+  * **`v1` (`0, 0`)**: flusso puramente lineare con uscite anticipate su errore.
   * **`v2` (`max_compile_retries > 0`)**: abilita il ciclo `compiler -> planner` su `PlanCompilationError`, passando `previous_plan` + `compile_feedback` e accumulando `compile_error_history`.
   * **`v3` (`max_replans > 0`)**: abilita il ciclo **Context-Injected Replanning** `joiner -> planner`:
-    1. Prima di ripartire, il nodo `joiner` archivia il round concluso in `execution_history: list[ExecutionRound]` e costruisce `replan_context` tramite `format_replan_context(...)`, elencando risultati già ottenuti (come valori letterali, **omettendo deliberatamente i vecchi `task_id`** per impedire all'LLM di creare `InputBinding` rotti verso round precedenti) e chiamate fallite da non ripetere.
+    1. Prima di ripartire, lo step `joiner` archivia il round concluso in `execution_history: list[ExecutionRound]` e costruisce `replan_context` tramite `format_replan_context(...)`, elencando risultati già ottenuti (come valori letterali, **omettendo deliberatamente i vecchi `task_id`** per impedire all'LLM di creare `InputBinding` rotti verso round precedenti) e chiamate fallite da non ripetere.
     2. `PlanCompiler` ed `Executor` restano **invariati al 100%**: validano ed eseguono un normale `CompiledDAG` pulito per i soli passi mancanti o di fallback.
     3. **Budget indipendenti e coesistenza v2 + v3**: ogni replan azzera `round_compile_attempts` (così il Round 2 ha un budget pieno di compile retry, mentre `metrics.compile_attempts` e `metrics.compile_retries` tengono i totali globali esatti); se il Round 2 sbaglia a compilare, il `Planner` riceve **sia** `replan_context` **sia** `previous_plan` + `compile_feedback`.
     4. **Graceful Degradation (proprietà di sicurezza monotonica)**: se un round di replan fallisce al `planner`, al `compiler` (budget esaurito) o all'`executor`, il router **non distrugge** i risultati già raccolti nel Round 1: devia sul `joiner` in modalità `allow_replan=False` sull'ultimo round riuscito in `execution_history`, consegnando comunque la miglior risposta parziale e registrando il guasto di replan in `replan_error` (lasciando `error = None`).
 * **Nessun parametro fittizio (`checkpointer`)**: `build_compiler_graph` non espone ancora un parametro `checkpointer` perché la serializzazione di `CompiledDAG` (che usa `MappingProxyType`) tramite `MemorySaver`/`SqliteSaver` non è stata ancora testata formalmente; verrà introdotto solo insieme ai relativi test di persistenza.
 
 > **In parole semplici:**
-> LangGraph è il **direttore d'orchestra** che coordina i quattro reparti tenendo un quaderno di stato condiviso:
+> Il flusso di lavoro ha le stesse identiche regole di regia (`v1`, `v2`, `v3` e la scorciatoia diretta senza tool), ma puoi scegliere chi fa da direttore d'orchestra:
+> * **`run_compiler_workflow` (Python puro)** se vuoi un motore leggero senza dipendere da alcun framework esterno;
+> * **`langgraph_adapters` (`StateGraph`)** se vuoi anche la plancia di controllo di LangGraph (streaming passo-passo `astream`, diagrammi automatici, futura persistenza/HITL e confronto diretto con `react_graph`).
+>
+> In entrambi i casi:
 > * Nella **versione 1**, se qualcosa va storto lo spettacolo si ferma subito.
 > * Nella **versione 2**, se l'Ispettore (`PlanCompiler`) trova errori *prima* di partire, rimanda la bozza al Pianificatore fino a 2 volte per farla correggere gratis prima di chiamare qualsiasi strumento.
-> * Nella **versione 3**, anche *dopo* che la squadra ha lavorato sul campo, se uno strumento era rotto (e ce n'è uno di riserva) oppure se al primo giro abbiamo scoperto un elenco di nomi su cui bisogna ora lavorare, il direttore salva il lavoro buono già fatto, mostra al Pianificatore i numeri già trovati e lancia un **secondo giro mirato** solo per ciò che manca. E se per caso il secondo giro va storto, il direttore ha una rete di sicurezza: non butta mai via i risultati buoni del primo giro!
+> * Nella **versione 3**, anche *dopo* che la squadra ha lavorato sul campo, se uno strumento era rotto (e ce n'è uno di riserva) oppure se al primo giro abbiamo scoperto un elenco di nomi su cui bisogna ora lavorare, il direttore salva il lavoro buono già fatto, mostra al Pianificatore i numeri già trovati e lancia un **secondo giro mirato** solo per ciò che manca. E se per caso il secondo giro va storto, c'è una rete di sicurezza: i risultati buoni del primo giro non vengono mai buttati via!
 
 ---
 
@@ -587,19 +608,22 @@ Nei benchmark di sistemi paralleli è facile confondere metriche simili ma conce
 
 Tutti gli esperimenti live sono stati eseguiti localmente tramite **Ollama** con il modello **`qwen3:8b`** (`temperature=0.0`, `joiner reasoning=False`). Tutti i dataset di output completi in JSON sono archiviati in `results/`.
 
-### 4.1 Overhead puro di orchestrazione LangGraph
+### 4.1 Overhead puro di orchestrazione: `run_compiler_workflow` vs LangGraph `StateGraph`
 
-Script: `experiments/test_graph_qwen3.py --mode overhead --overhead-iters 50`
+Script: `experiments/benchmark_workflow_vs_langgraph.py --iters 100` (Report: `results/benchmark_workflow_vs_langgraph.json`) e `experiments/test_graph_qwen3.py --mode overhead --overhead-iters 50`
 
-Per isolare il costo di LangGraph dalla varianza non deterministica dell'LLM, abbiamo confrontato la chiamata diretta in Python dei 4 componenti contro `build_compiler_graph(...)` su **50 iterazioni deterministiche** (modelli fake e tool a 0 ms):
+Per isolare in modo esatto il costo del runtime di LangGraph dalla varianza dell'LLM, abbiamo confrontato il nostro runner pure-Python (`llm_compiler.run_compiler_workflow`) contro l'adattatore LangGraph (`langgraph_adapters.build_compiler_graph`) sugli **stessi identici 4 step**, con modelli fake e tool a 0 ms, su **100 iterazioni deterministiche** per ciascuno dei 4 regimi del workflow:
 
-| Configurazione | Mediana | Media | Note |
-| :--- | ---: | ---: | :--- |
-| Pipeline diretta Python | `0.351 ms` | `0.368 ms` | 4 chiamate sequenziali dirette |
-| LangGraph `StateGraph` (`graph_wall_time`) | `2.186 ms` | `2.230 ms` | Include dispatch nodi e gestione stato Pregel |
-| **Overhead puro LangGraph** | **`+1.83 ms`** | **`+1.86 ms`** | Nei run live su `qwen3:8b`: `~3.8–4.1 ms` (`< 0.1%` del tempo totale) |
+| Scenario | Transizioni (hop) | Parità output | Pure-Python (med) | LangGraph `StateGraph` (med) | Overhead LG | Overhead / hop | Build grafo LG *(una tantum)* |
+| :--- | :---: | :---: | ---: | ---: | ---: | ---: | ---: |
+| `empty_plan_shortcut` *(tasks=[])* | 2 | **YES** | `0.050 ms` | `0.811 ms` | **`+0.760 ms`** | `0.380 ms` | `3.23 ms` |
+| `v1_linear_happy_path` | 4 | **YES** | `0.337 ms` | `1.837 ms` | **`+1.500 ms`** | `0.375 ms` | `2.61 ms` |
+| `v2_compile_retry_x2` | 8 | **YES** | `0.367 ms` | `3.027 ms` | **`+2.660 ms`** | `0.333 ms` | `2.73 ms` |
+| `v3_runtime_replan_x1` | 8 | **YES** | `0.747 ms` | `4.933 ms` | **`+4.186 ms`** | `0.523 ms` | `2.76 ms` |
 
-**Conclusione:** usare LangGraph come orchestratore macro aggiunge meno di 2 millisecondi a vuoto (~4 ms nei run live con payload completi) — completamente trascurabile rispetto ai secondi dell'LLM, a fronte di un enorme guadagno in osservabilità, streaming e gestione dei cicli v2/v3.
+*(Anche la misura storica su 50 iterazioni in `test_graph_qwen3.py --mode overhead` conferma valori identici: `+1.83 ms` a vuoto su v1 e `~3.8–4.1 ms` nei run live con `qwen3:8b`, pari a `< 0.1%` del tempo totale).*
+
+**Conclusione:** i due orchestratori producono risultati **bit-a-bit equivalenti (`4/4 Match = YES`)** su stato, risposta finale, contatori di retry/replan e `execution_history`. LangGraph introduce un overhead lineare di soli **`~0.33–0.52 ms` per transizione** (`+1.50 ms` su v1, `+4.19 ms` su v3) — completamente trascurabile rispetto ai secondi di inferenza LLM — in cambio di streaming `astream`, export Mermaid/PNG, predisposizione a checkpointer/HITL e interfaccia uniforme con `react_graph`. Quando quelle feature non servono, `run_compiler_workflow` gira in Python puro con zero dipendenze da LangGraph.
 
 ---
 
@@ -804,7 +828,7 @@ L'insieme dei 6 benchmark eseguiti in questo repository porta a una conclusione 
 | Dimensione valutata | Risultato sperimentale misurato | Implicazione progettuale |
 | :--- | :--- | :--- |
 | **Schema di pianificazione** *(Strada A)* | Da ~2/3 di fallimenti → **16/16 (100%)** sulla suite 4 tool (`qwen3:8b`) | Unificare valori statici e `InputBinding` nello stesso dizionario `inputs` elimina per costruzione la principale fonte di errore sui modelli locali 8B. |
-| **Orchestrazione LangGraph** | Overhead puro **`+1.83 ms`** deterministico (`~3.8–4.1 ms` live, `< 0.1%`) | Usare LangGraph come orchestratore macro stateful è praticamente gratuito a fronte di streaming, cicli v2/v3 e ispezionabilità. |
+| **Orchestrazione: Python vs LangGraph** | Parità **4/4** tra `run_compiler_workflow` e `StateGraph`; overhead LG **`+0.76 → +4.19 ms`** (`~0.33–0.52 ms/hop`, `< 0.1%` live) | Il core `llm_compiler` resta **100% LangGraph-agnostic** (verificato via AST); l'adattatore LangGraph è opzionale e quasi gratuito quando servono `astream`, grafi esportabili o persistenza. |
 | **Motore di esecuzione DAG** | Event-driven batte LangGraph Pregel BSP fino al **`-33.7%`** su DAG asimmetrici | Tenere l'`Executor` separato da LangGraph (`asyncio` ready-queue senza barriere di superstep) è decisivo quando le API hanno latenze eterogenee. |
 | **Compile-time self-correction (v2)** | Hard Suite 10 tool: `33% -> 83%` validità (`17% -> 50%` esatti a `reasoning=False`), **`100%` (6/6)** con `reasoning=True` | `v2` e `reasoning=True` risolvono classi di errore ortogonali (contratto/schema vs logica matematica pura), con **zero costo sul caso felice**. |
 | **Runtime replanning (v3)** | Suite runtime: **`25% -> 100%`** già a `reasoning=False`, **`0` replan sprecati** su `Atlantis` | Context-Injected Replanning + visibilità di `tool_catalog` al Joiner + Graceful Degradation recuperano guasti runtime (503, alias, discovery 2-stage) senza mai peggiorare il Round 1. |
@@ -828,47 +852,64 @@ L'insieme dei 6 benchmark eseguiti in questo repository porta a una conclusione 
 
 ```text
 langgraph-llm-compiler/
-├── pyproject.toml                     # Dipendenze, configurazione ruff e pytest (testpaths = ["tests"])
-├── README.md                          # Questa documentazione tecnica + guida in parole semplici
+├── pyproject.toml                           # Dipendenze, 2 pacchetti (llm_compiler, langgraph_adapters), ruff e pytest
+├── README.md                                # Questa documentazione tecnica + guida in parole semplici
 ├── src/
-│   └── langgraph_llm_compiler/
-│       ├── llm.py                     # Factory ChatOllama (model, temperature, reasoning, num_predict)
-│       ├── planner/
-│       │   ├── schemas.py             # NonEmptyStr, InputBinding, TaskSpec (inputs unificato), ExecutionPlan
-│       │   └── planner.py             # Planner (plan / aplan + compile feedback v2 + replan_context v3)
-│       ├── compiler/
-│       │   ├── registry.py            # ToolSpec, ToolRegistry (source of truth + to_planner_catalog)
-│       │   ├── dag.py                 # CompilationIssue, PlanCompilationError, CompiledDAG (immutabile)
-│       │   └── compiler.py            # PlanCompiler (validazione semantica in singola passata + Kahn scheduling)
-│       ├── executor/
-│       │   ├── results.py             # TaskExecutionResult, ExecutionResult (frozen, serializzabili)
-│       │   ├── bindings.py            # BindingResolutionError, resolve_output_path, resolve_task_inputs
-│       │   └── executor.py            # Executor (scheduler asyncio event-driven, best-effort, timeout)
-│       ├── joiner/
-│       │   ├── schemas.py             # ExecutionRound, JoinerOutput, JoinerDecisionOutput, JoinerResult
-│       │   └── joiner.py              # Joiner (finish / replan), classificazione multi-round, format_replan_context
-│       └── graph/
-│           ├── state.py               # CompilerState, WorkflowError, WorkflowMetrics, update_metrics
-│           ├── nodes.py               # 4 nodi async sottili con retry v2, replan v3 e graceful degradation
-│           └── builder.py             # build_compiler_graph(..., max_compile_retries=0, max_replans=0)
-├── tests/                             # 67 test unitari deterministici (zero dipendenza da Ollama)
+│   ├── llm_compiler/                        # Core 100% framework-agnostic (ZERO import da langgraph)
+│   │   ├── __init__.py                      # Export pubblici del core + run_compiler_workflow
+│   │   ├── llm.py                           # Factory ChatOllama (model, temperature, reasoning, num_predict)
+│   │   ├── state.py                         # CompilerState, WorkflowError, WorkflowMetrics, update_metrics
+│   │   ├── steps.py                         # 4 step async agnostici (make_*_step) con retry v2, replan v3 e graceful degradation
+│   │   ├── workflow.py                      # Runner pure-Python run_compiler_workflow (v1/v2/v3 + scorciatoia tasks=[])
+│   │   ├── planner/
+│   │   │   ├── schemas.py                   # NonEmptyStr, InputBinding, TaskSpec (inputs unificato), ExecutionPlan
+│   │   │   └── planner.py                   # Planner (plan / aplan + compile feedback v2 + replan_context v3)
+│   │   ├── compiler/
+│   │   │   ├── registry.py                  # ToolSpec, ToolRegistry (source of truth + to_planner_catalog)
+│   │   │   ├── dag.py                       # CompilationIssue, PlanCompilationError, CompiledDAG (immutabile)
+│   │   │   └── compiler.py                  # PlanCompiler (validazione semantica in singola passata + Kahn scheduling)
+│   │   ├── executor/
+│   │   │   ├── results.py                   # TaskExecutionResult, ExecutionResult (frozen, serializzabili)
+│   │   │   ├── bindings.py                  # BindingResolutionError, resolve_output_path, resolve_task_inputs
+│   │   │   └── executor.py                  # Executor (scheduler asyncio event-driven, best-effort, timeout)
+│   │   ├── joiner/
+│   │   │   ├── schemas.py                   # ExecutionRound, JoinerOutput, JoinerDecisionOutput, JoinerResult
+│   │   │   └── joiner.py                    # Joiner (finish / replan / join_direct), classificazione multi-round, format_replan_context
+│   │   └── tools/
+│   │       └── python_sandbox.py            # Tool condiviso neutro run_python_code (validazione AST + safe builtins)
+│   └── langgraph_adapters/                  # Unico pacchetto del repo che importa langgraph
+│       ├── __init__.py                      # Export pubblici build_compiler_graph e build_react_graph
+│       ├── compiler_graph/
+│       │   └── builder.py                   # build_compiler_graph(..., max_compile_retries=0, max_replans=0)
+│       └── react_graph/
+│           ├── state.py                     # ReActState, ReActMetrics
+│           ├── tools.py                     # Adattatore ToolRegistry -> LangChain StructuredTool con validazione I/O e timeout
+│           └── builder.py                   # build_react_graph (ToolNode parallelo + recovery-aware status + max_iterations)
+├── tests/                                   # 93 test unitari deterministici (zero dipendenza da Ollama)
+│   ├── test_architecture_boundaries.py      # Verifica AST (0 import langgraph in llm_compiler) + parità workflow pure-Python
 │   ├── test_planner_schemas.py
 │   ├── test_planner.py
 │   ├── test_compiler.py
 │   ├── test_executor.py
 │   ├── test_joiner.py
-│   └── test_graph.py
+│   ├── test_graph.py
+│   ├── test_python_sandbox.py
+│   └── test_react.py
 ├── experiments/
-│   ├── test_planner_qwen3.py          # Pipeline diretta Python (Registry -> Planner -> Compiler -> Executor -> Joiner)
-│   ├── test_graph_qwen3.py            # Esperimento A (live LangGraph vs Direct) + Esperimento B (overhead isolato)
-│   ├── test2.py                       # Trace visivo fase-per-fase via astream + export PNG/Mermaid in results/
-│   ├── benchmark_v1_baseline.py       # Suite baseline v1 (4 tool, 8 query, reasoning=False vs True)
-│   ├── benchmark_v2_hard_suite.py     # Hard suite 10 tool con grading numerico automatico: v1 vs v2
-│   ├── benchmark_v3_replanning.py     # Suite runtime replanning v2 vs v3 (fallback, alias, 2-stage, no-waste)
-│   ├── benchmark_compiler_vs_react.py # Confronto apples-to-apples LLM Compiler v3 vs LangGraph ReAct (2 suite)
-│   ├── benchmark_latency_crossover.py # Sweep latenza I/O (0.5s -> 8.0s) + grafico SVG del crossover
-│   └── benchmark_scheduling.py        # Benchmark deterministico Event-driven vs LangGraph Pregel BSP vs Seq
-└── results/                           # Output sperimentali salvati (JSON, PNG/SVG e report Mermaid)
+│   ├── test_planner_qwen3.py                # Pipeline diretta Python (Registry -> Planner -> Compiler -> Executor -> Joiner)
+│   ├── test_graph_qwen3.py                  # Esperimento A (live LangGraph vs Direct) + Esperimento B (overhead isolato)
+│   ├── test2.py                             # Trace visivo fase-per-fase via astream + export PNG/Mermaid in results/
+│   ├── benchmark_workflow_vs_langgraph.py   # Benchmark deterministico run_compiler_workflow vs LangGraph StateGraph (4 scenari)
+│   ├── benchmark_scheduling.py              # Benchmark deterministico Event-driven vs LangGraph Pregel BSP vs Seq
+│   ├── benchmark_v1_baseline.py             # Suite baseline v1 (4 tool, 8 query, reasoning=False vs True)
+│   ├── benchmark_v2_hard_suite.py           # Hard suite 10 tool con grading numerico automatico: v1 vs v2
+│   ├── benchmark_v3_replanning.py           # Suite runtime replanning v2 vs v3 (fallback, alias, 2-stage, no-waste)
+│   ├── benchmark_compiler_vs_react.py       # Confronto apples-to-apples LLM Compiler v3 vs LangGraph ReAct (2 suite)
+│   ├── benchmark_latency_crossover.py       # Sweep latenza I/O (0.5s -> 8.0s) + grafico SVG del crossover
+│   ├── demo_sales_analysis_v3.py            # Demo live v3 con tool analitico su dataset vendite
+│   ├── demo_python_code_v3.py               # Demo live v3 con run_python_code sandboxed + fan-in parallelo
+│   └── demo_react_sales_python.py           # Demo live ReAct sugli stessi tool (sales + python_sandbox) con trace astream
+└── results/                                 # Output sperimentali salvati (JSON, PNG/SVG e report Mermaid)
 ```
 
 ---
@@ -883,7 +924,7 @@ langgraph-llm-compiler/
 # Installa tutte le dipendenze (inclusi pytest, ruff e grandalf per draw_ascii)
 uv sync
 
-# Esegui la suite completa di 67 test unitari deterministici
+# Esegui la suite completa di 93 test unitari deterministici
 uv run pytest -v
 
 # Controllo statico stile e qualità con ruff
@@ -893,6 +934,9 @@ uv run ruff check src tests experiments
 ### Benchmark deterministici (non richiedono Ollama)
 
 ```bash
+# Confronto pure-Python run_compiler_workflow vs LangGraph StateGraph su 4 scenari (100 iterazioni)
+uv run python experiments/benchmark_workflow_vs_langgraph.py --iters 100
+
 # Confronto Event-driven vs LangGraph Pregel BSP vs Sequenziale su 4 topologie DAG
 uv run python experiments/benchmark_scheduling.py --repeats 3
 
@@ -921,17 +965,23 @@ uv run python experiments/benchmark_compiler_vs_react.py --suite both
 
 # Curva di crossover I/O (0.5s -> 8.0s) + export grafico vettoriale results/latency_crossover.svg
 uv run python experiments/benchmark_latency_crossover.py
+
+# Demo live con tool analitici e python_sandbox (LLM Compiler v3 vs ReAct)
+uv run python experiments/demo_python_code_v3.py
+uv run python experiments/demo_react_sales_python.py
 ```
 
 ---
 
 ## 8. Roadmap
 
-- [x] **Planner**: schemi Pydantic (`inputs` unificato Strada A), structured output `json_schema`, prompt neutro anti-overfitting, supporto a compile feedback v2 e `replan_context` v3, test unitari.
+- [x] **Planner**: schemi Pydantic (`inputs` unificato Strada A, supporto empty-plan `tasks=[]`), structured output `json_schema`, prompt neutro anti-overfitting, supporto a compile feedback v2 e `replan_context` v3, test unitari.
 - [x] **Compiler**: `ToolRegistry`, validazione semantica in singola passata (incluso `malformed_binding` e `invalid_output_path` multi-livello), algoritmo di Kahn, `CompiledDAG` immutabile, test unitari.
 - [x] **Executor**: scheduler `asyncio` event-driven, binding resolution, validazione runtime I/O, best-effort + propagazione `skipped`, `max_concurrency`, `task_timeout_s`, telemetria serializzabile, test unitari.
-- [x] **Joiner v1 → v3**: sintesi risposta finale nella lingua dell'utente (`JoinerOutput`), decisione `finish`/`replan` informata dal catalogo (`JoinerDecisionOutput`), `status` e `missing_information` deterministici multi-round (`JoinerResult`), test unitari.
+- [x] **Joiner v1 → v3**: sintesi risposta finale nella lingua dell'utente (`JoinerOutput`, `join_direct`), decisione `finish`/`replan` informata dal catalogo (`JoinerDecisionOutput`), `status` e `missing_information` deterministici multi-round (`JoinerResult`), test unitari.
 - [x] **LangGraph v1**: `StateGraph` lineare con uscite condizionali su errore, `WorkflowMetrics`, benchmark overhead isolato e benchmark deterministico di scheduling (Event-driven vs Pregel BSP).
 - [x] **v2 — Compile-time self-correction**: ciclo `compiler -> planner` con `previous_plan`, `compile_feedback` (`CompilationIssue`), `compile_error_history`, latenze cumulative, `max_compile_retries` retrocompatibile e Hard Suite 10 tool (matrice 2×2).
-- [x] **v3 — Runtime replanning**: ciclo `joiner -> planner` (Context-Injected Replanning), `execution_history`, budget separati per round, Graceful Degradation (`replan_error`), suite di 67 test unitari e benchmark live v2 vs v3 (`25% -> 100%` a `reasoning=False`).
-- [x] **Fase 6 — Benchmark comparativi cross-architettura**: confronto riproducibile *apples-to-apples* tra **LLM Compiler v3** e **LangGraph ReAct** su `standard` (6 casi) e `io_heavy` (3 casi multi-hop asimmetrici): **9/9 (100%)** vs `8/9 (89%)`, **-57.1% chiamate LLM** e **-27.8% token totali** su flussi multi-API.
+- [x] **v3 — Runtime replanning**: ciclo `joiner -> planner` (Context-Injected Replanning), `execution_history`, budget separati per round, Graceful Degradation (`replan_error`) e benchmark live v2 vs v3 (`25% -> 100%` a `reasoning=False`).
+- [x] **Fase 6 — Benchmark comparativi cross-architettura**: confronto riproducibile *apples-to-apples* tra **LLM Compiler v3** e **LangGraph ReAct** su `standard` (6 casi), `io_heavy` (3 casi multi-hop asimmetrici: **9/9 (100%)** vs `8/9 (89%)`, **-57.1% chiamate LLM**, **-27.8% token**) e curva di crossover I/O (`slow_hop ≈ 3.53 s`, fino a **-15.5%** wall-clock).
+- [x] **Tool condivisi neutri & baseline ReAct modulare**: pacchetto `llm_compiler.tools` (`python_sandbox.py` validato via AST, 100% *architecture-neutral*) + `langgraph_adapters.react_graph` + demo live comparative.
+- [x] **Decoupling architetturale (`llm_compiler` vs `langgraph_adapters`)**: core 100% LangGraph-agnostic (verificato via AST in `test_architecture_boundaries.py`), runner pure-Python `run_compiler_workflow`, 93 test unitari deterministici e benchmark deterministico `run_compiler_workflow` vs LangGraph `StateGraph` (`4/4` parità esatta, `~0.33–0.52 ms/hop`).
