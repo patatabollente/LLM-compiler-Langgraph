@@ -2,8 +2,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from langgraph_llm_compiler.executor.results import ExecutionResult
-from langgraph_llm_compiler.planner.schemas import ExecutionPlan, NonEmptyStr
+from llm_compiler.executor.results import ExecutionResult
+from llm_compiler.planner.schemas import ExecutionPlan, NonEmptyStr
 
 JoinerStatus = Literal["complete", "partial", "failed"]
 JoinerAction = Literal["finish", "replan"]

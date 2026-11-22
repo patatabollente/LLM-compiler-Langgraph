@@ -5,17 +5,17 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from langgraph_llm_compiler.compiler import (
+from llm_compiler.compiler import (
     CompiledDAG,
     PlanCompilationError,
     PlanCompiler,
     ToolRegistry,
     ToolSpec,
 )
-from langgraph_llm_compiler.executor import ExecutionResult, Executor
-from langgraph_llm_compiler.joiner import Joiner, JoinerOutputError, JoinerResult
-from langgraph_llm_compiler.llm import create_ollama_chat_model
-from langgraph_llm_compiler.planner import ExecutionPlan, Planner, PlannerOutputError
+from llm_compiler.executor import ExecutionResult, Executor
+from llm_compiler.joiner import Joiner, JoinerOutputError, JoinerResult
+from llm_compiler.llm import create_ollama_chat_model
+from llm_compiler.planner import ExecutionPlan, Planner, PlannerOutputError
 
 # =============================================================================
 # Configurazione esperimento

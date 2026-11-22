@@ -82,4 +82,11 @@ class ExecutionPlan(BaseModel):
     model_config = _BASE_CONFIG
 
     objective: NonEmptyStr
-    tasks: list[TaskSpec] = Field(min_length=1)
+    tasks: list[TaskSpec] = Field(
+        default_factory=list,
+        description=(
+            "Ordered list of tasks to execute. Leave empty ([]) when no available "
+            "tool is needed or applicable (e.g., greetings, conversational messages, "
+            "or requests outside the tool catalog)."
+        ),
+    )

@@ -20,12 +20,13 @@ Follow these rules:
 5. Put every tool parameter inside the single "inputs" dictionary.
 6. Never use separate "arguments", "input_bindings", or "dependencies" fields.
 7. For a statically known parameter value (such as a string, boolean, or constant number like 4), put the literal value directly in "inputs".
-8. For a dynamic parameter value obtained from a previous task's output, put an InputBinding object {"task_id": "<upstream_id>", "output_path": ["key1", "key2"]} directly as that parameter's value in "inputs".
+8. For a dynamic parameter value obtained from a previous task's output, put an InputBinding object {"task_id": "<upstream_id>", "output_path": ["key1", "key2"]} directly as that parameter's value in "inputs". Never wrap an InputBinding inside a nested dict or list (e.g. use "value": {"task_id": "task_1", "output_path": ["items"]}, NOT "value": {"items": {"task_id": "task_1", "output_path": ["items"]}}).
 9. Use output_path to identify the required field in a task output (for nested objects, list every key in order, e.g. ["economy", "gdp"]). Use [] to refer to the entire output.
 10. Make sure all referenced tasks exist in the execution plan and never reference a task's own task_id.
 11. Avoid circular dependencies.
 12. Respect the input parameter names and output structure described in the tool catalog.
 13. If a follow-up step requires calling a tool separately for each element of a list whose items are only known at runtime (and cannot be bound via a single scalar output_path), plan ONLY the discovery task(s) in this plan — do NOT invent list-index paths or pass a list into a scalar parameter.
+14. If the user's request does not require any tool from AVAILABLE TOOLS (for example a greeting, casual conversation, or a request completely outside the available tools), return an empty "tasks": [] list — NEVER invent a fake tool name such as "none" or "noop".
 
 Examples of valid tasks (using abstract placeholder tool names — always use only tools from AVAILABLE TOOLS):
 

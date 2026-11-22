@@ -1,0 +1,59 @@
+{
+  "benchmark": "pure_python_workflow_vs_langgraph",
+  "timestamp_utc": "20261122T174422Z",
+  "iterations_per_scenario": 100,
+  "results": [
+    {
+      "scenario_id": "empty_plan_shortcut",
+      "hops": 2,
+      "iters": 100,
+      "equivalent": true,
+      "py_median_ms": 0.05,
+      "py_p95_ms": 0.064,
+      "lg_median_ms": 0.811,
+      "lg_p95_ms": 1.11,
+      "overhead_median_ms": 0.76,
+      "overhead_per_hop_ms": 0.38,
+      "lg_compile_ms": 3.234
+    },
+    {
+      "scenario_id": "v1_linear_happy_path",
+      "hops": 4,
+      "iters": 100,
+      "equivalent": true,
+      "py_median_ms": 0.337,
+      "py_p95_ms": 0.542,
+      "lg_median_ms": 1.837,
+      "lg_p95_ms": 2.519,
+      "overhead_median_ms": 1.5,
+      "overhead_per_hop_ms": 0.375,
+      "lg_compile_ms": 2.611
+    },
+    {
+      "scenario_id": "v2_compile_retry_x2",
+      "hops": 8,
+      "iters": 100,
+      "equivalent": true,
+      "py_median_ms": 0.367,
+      "py_p95_ms": 0.532,
+      "lg_median_ms": 3.027,
+      "lg_p95_ms": 3.452,
+      "overhead_median_ms": 2.66,
+      "overhead_per_hop_ms": 0.333,
+      "lg_compile_ms": 2.731
+    },
+    {
+      "scenario_id": "v3_runtime_replan_x1",
+      "hops": 8,
+      "iters": 100,
+      "equivalent": true,
+      "py_median_ms": 0.747,
+      "py_p95_ms": 0.995,
+      "lg_median_ms": 4.933,
+      "lg_p95_ms": 5.969,
+      "overhead_median_ms": 4.186,
+      "overhead_per_hop_ms": 0.523,
+      "lg_compile_ms": 2.759
+    }
+  ]
+}

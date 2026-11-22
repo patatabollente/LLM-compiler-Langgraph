@@ -1,29 +1,29 @@
 import time
 from collections.abc import Awaitable, Callable, Mapping
 
-from langgraph_llm_compiler.compiler.compiler import PlanCompiler
-from langgraph_llm_compiler.compiler.dag import PlanCompilationError
-from langgraph_llm_compiler.executor.executor import Executor
-from langgraph_llm_compiler.joiner.joiner import (
+from llm_compiler.compiler.compiler import PlanCompiler
+from llm_compiler.compiler.dag import PlanCompilationError
+from llm_compiler.executor.executor import Executor
+from llm_compiler.joiner.joiner import (
     Joiner,
     JoinerOutputError,
     format_replan_context,
 )
-from langgraph_llm_compiler.joiner.schemas import ExecutionRound
-from langgraph_llm_compiler.planner.planner import Planner, PlannerOutputError
+from llm_compiler.joiner.schemas import ExecutionRound
+from llm_compiler.planner.planner import Planner, PlannerOutputError
 
 from .state import CompilerState, WorkflowError, WorkflowMetrics, update_metrics
 
-GraphNode = Callable[[CompilerState], Awaitable[dict[str, object]]]
+WorkflowStep = Callable[[CompilerState], Awaitable[dict[str, object]]]
 
 
-def make_planner_node(
+def make_planner_step(
     planner: Planner,
     catalog: Mapping[str, str],
-) -> GraphNode:
-    """Create the async LangGraph node wrapping Planner.aplan()."""
+) -> WorkflowStep:
+    """Create the async workflow step wrapping Planner.aplan()."""
 
-    async def planner_node(state: CompilerState) -> dict[str, object]:
+    async def planner_step(state: CompilerState) -> dict[str, object]:
         current_metrics = state.get("metrics") or WorkflowMetrics()
         request = state["request"]
         feedback = state.get("compile_feedback")
@@ -110,13 +110,13 @@ def make_planner_node(
             ),
         }
 
-    return planner_node
+    return planner_step
 
 
-def make_compiler_node(compiler: PlanCompiler) -> GraphNode:
-    """Create the async LangGraph node wrapping PlanCompiler.compile()."""
+def make_compiler_step(compiler: PlanCompiler) -> WorkflowStep:
+    """Create the async workflow step wrapping PlanCompiler.compile()."""
 
-    async def compiler_node(state: CompilerState) -> dict[str, object]:
+    async def compiler_step(state: CompilerState) -> dict[str, object]:
         current_metrics = state.get("metrics") or WorkflowMetrics()
         plan = state.get("plan")
         if plan is None:
@@ -203,13 +203,13 @@ def make_compiler_node(compiler: PlanCompiler) -> GraphNode:
             ),
         }
 
-    return compiler_node
+    return compiler_step
 
 
-def make_executor_node(executor: Executor) -> GraphNode:
-    """Create the async LangGraph node wrapping Executor.execute()."""
+def make_executor_step(executor: Executor) -> WorkflowStep:
+    """Create the async workflow step wrapping Executor.execute()."""
 
-    async def executor_node(state: CompilerState) -> dict[str, object]:
+    async def executor_step(state: CompilerState) -> dict[str, object]:
         current_metrics = state.get("metrics") or WorkflowMetrics()
         dag = state.get("compiled_dag")
         if dag is None:
@@ -249,18 +249,18 @@ def make_executor_node(executor: Executor) -> GraphNode:
             "metrics": update_metrics(state, execution_latency_ms=total_exec_ms),
         }
 
-    return executor_node
+    return executor_step
 
 
-def make_joiner_node(
+def make_joiner_step(
     joiner: Joiner,
     *,
     catalog: Mapping[str, str] | None = None,
     max_replans: int = 0,
-) -> GraphNode:
-    """Create the async LangGraph node wrapping Joiner.join()."""
+) -> WorkflowStep:
+    """Create the async workflow step wrapping Joiner.join()."""
 
-    async def joiner_node(state: CompilerState) -> dict[str, object]:
+    async def joiner_step(state: CompilerState) -> dict[str, object]:
         current_metrics = state.get("metrics") or WorkflowMetrics()
         history = list(state.get("execution_history", []))
         upstream_error = state.get("error")
@@ -268,6 +268,8 @@ def make_joiner_node(
         # Graceful degradation: if a replan round failed before execution completed,
         # synthesize the best available answer from prior completed rounds.
         degraded_from_replan = upstream_error is not None and len(history) > 0
+        raw_plan = state.get("plan")
+        direct_no_tools = False
         if degraded_from_replan:
             last_round = history[-1]
             prior_rounds = history[:-1]
@@ -275,16 +277,29 @@ def make_joiner_node(
             plan = last_round.plan
             allow_replan = False
             recorded_replan_error: WorkflowError | None = upstream_error
+        elif raw_plan is not None and len(raw_plan.tasks) == 0:
+            recorded_replan_error = state.get("replan_error")
+            allow_replan = False
+            if history:
+                last_round = history[-1]
+                prior_rounds = history[:-1]
+                execution_result = last_round.execution_result
+                plan = last_round.plan
+            else:
+                direct_no_tools = True
+                prior_rounds = []
+                execution_result = None
+                plan = raw_plan
         else:
             execution_result = state.get("execution_result")
-            plan = state.get("plan")
+            plan = raw_plan
             prior_rounds = history
             allow_replan = (
                 max_replans > 0 and current_metrics.replan_attempts < max_replans
             )
             recorded_replan_error = state.get("replan_error")
 
-        if execution_result is None:
+        if not direct_no_tools and execution_result is None:
             return {
                 "joiner_result": None,
                 "final_answer": None,
@@ -298,14 +313,22 @@ def make_joiner_node(
 
         t0 = time.perf_counter()
         try:
-            joiner_result = await joiner.join(
-                request=state["request"],
-                execution_result=execution_result,
-                plan=plan,
-                prior_rounds=prior_rounds,
-                tool_catalog=catalog if allow_replan else None,
-                allow_replan=allow_replan,
-            )
+            if direct_no_tools:
+                joiner_result = await joiner.join_direct(
+                    request=state["request"],
+                    plan=plan,
+                    tool_catalog=catalog,
+                )
+            else:
+                assert execution_result is not None
+                joiner_result = await joiner.join(
+                    request=state["request"],
+                    execution_result=execution_result,
+                    plan=plan,
+                    prior_rounds=prior_rounds,
+                    tool_catalog=catalog if allow_replan else None,
+                    allow_replan=allow_replan,
+                )
         except ValueError as exc:
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             total_join_ms = (current_metrics.joining_latency_ms or 0.0) + elapsed_ms
@@ -405,4 +428,4 @@ def make_joiner_node(
             result_update["replan_error"] = recorded_replan_error
         return result_update
 
-    return joiner_node
+    return joiner_step

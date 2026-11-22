@@ -5,8 +5,8 @@ from typing import Any, Literal
 import pytest
 from pydantic import BaseModel
 
-from langgraph_llm_compiler.compiler import PlanCompiler, ToolRegistry, ToolSpec
-from langgraph_llm_compiler.executor import (
+from llm_compiler.compiler import PlanCompiler, ToolRegistry, ToolSpec
+from llm_compiler.executor import (
     BindingResolutionError,
     ExecutionResult,
     Executor,
@@ -14,7 +14,7 @@ from langgraph_llm_compiler.executor import (
     resolve_output_path,
     resolve_task_inputs,
 )
-from langgraph_llm_compiler.planner import ExecutionPlan, InputBinding, TaskSpec
+from llm_compiler.planner import ExecutionPlan, InputBinding, TaskSpec
 
 
 class PopulationInput(BaseModel):

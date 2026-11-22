@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from langgraph_llm_compiler.planner import (
+from llm_compiler.planner import (
     ExecutionPlan,
     InputBinding,
     Planner,

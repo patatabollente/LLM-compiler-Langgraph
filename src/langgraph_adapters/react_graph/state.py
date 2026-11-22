@@ -4,7 +4,7 @@ from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, ConfigDict
 
-from langgraph_llm_compiler.graph.state import WorkflowStatus
+from llm_compiler.state import WorkflowStatus
 
 ReActStage = Literal["agent", "tools"]
 

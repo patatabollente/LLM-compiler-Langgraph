@@ -11,12 +11,12 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from langgraph_llm_compiler.compiler import PlanCompiler, ToolRegistry, ToolSpec
-from langgraph_llm_compiler.executor import Executor
-from langgraph_llm_compiler.graph import build_compiler_graph
-from langgraph_llm_compiler.joiner import Joiner
-from langgraph_llm_compiler.llm import create_ollama_chat_model
-from langgraph_llm_compiler.planner import Planner
+from langgraph_adapters.compiler_graph import build_compiler_graph
+from llm_compiler.compiler import PlanCompiler, ToolRegistry, ToolSpec
+from llm_compiler.executor import Executor
+from llm_compiler.joiner import Joiner
+from llm_compiler.llm import create_ollama_chat_model
+from llm_compiler.planner import Planner
 
 # =============================================================================
 # Configuration & tool contracts (identical across runs for reproducibility)

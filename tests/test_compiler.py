@@ -3,14 +3,14 @@ from typing import Any, Literal
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
-from langgraph_llm_compiler.compiler import (
+from llm_compiler.compiler import (
     CompiledDAG,
     PlanCompilationError,
     PlanCompiler,
     ToolRegistry,
     ToolSpec,
 )
-from langgraph_llm_compiler.planner import ExecutionPlan, InputBinding, TaskSpec
+from llm_compiler.planner import ExecutionPlan, InputBinding, TaskSpec
 
 
 class PopulationInput(BaseModel):
@@ -594,4 +594,105 @@ def test_detects_malformed_binding_with_clear_diagnostic():
         ("malformed_binding", "task_3", "x"),
     ]
     assert "output, path" in exc_info.value.issues[0].message
+
+
+def test_detects_nested_binding_in_dict_and_list():
+    """Regression test for InputBinding nested inside a dict or list (e.g. data: Any)."""
+
+    class AnyPayloadInput(BaseModel):
+        code: str
+        data: Any = None
+        extra_data: Any = None
+
+    registry = _build_registry()
+    registry.register(
+        ToolSpec(
+            name="run_python_code",
+            description="Run code with arbitrary payload",
+            func=lambda code, data=None, extra_data=None: {"result": data},
+            input_schema=AnyPayloadInput,
+        )
+    )
+    compiler = PlanCompiler(registry)
+
+    plan = ExecutionPlan.model_validate(
+        {
+            "objective": "Nested binding regression",
+            "tasks": [
+                {
+                    "task_id": "task_1",
+                    "tool_name": "population_lookup",
+                    "description": "Italy",
+                    "inputs": {"country": "Italy"},
+                },
+                {
+                    "task_id": "task_2",
+                    "tool_name": "run_python_code",
+                    "description": "Binding wrapped in dict and list",
+                    "inputs": {
+                        "code": "result = data",
+                        "data": {
+                            "results": {
+                                "task_id": "task_1",
+                                "output_path": ["population"],
+                            }
+                        },
+                        "extra_data": [{"task_id": "task_1"}],
+                    },
+                },
+            ],
+        }
+    )
+
+    with pytest.raises(PlanCompilationError) as exc_info:
+        compiler.compile(plan)
+
+    issues = [(i.code, i.task_id, i.field) for i in exc_info.value.issues]
+    assert issues == [
+        ("nested_binding", "task_2", "data"),
+        ("nested_binding", "task_2", "extra_data"),
+    ]
+    assert "'results'" in exc_info.value.issues[0].message
+    assert '{"task_id": "task_1", "output_path": ["population"]}' in exc_info.value.issues[0].message
+    assert "'[0]'" in exc_info.value.issues[1].message
+    assert '{"task_id": "task_1"}' in exc_info.value.issues[1].message
+
+
+def test_allows_legitimate_nested_domain_dict_with_task_id_key():
+    """Static domain payloads containing a non-binding 'task_id' must not trigger nested_binding."""
+
+    class PayloadInput(BaseModel):
+        payload: dict[str, Any]
+
+    registry = ToolRegistry(
+        [
+            ToolSpec(
+                name="submit_ticket",
+                description="Submit external ticket payload",
+                func=lambda payload: payload,
+                input_schema=PayloadInput,
+            )
+        ]
+    )
+    compiler = PlanCompiler(registry)
+
+    plan = ExecutionPlan(
+        objective="Submit external Jira task payload",
+        tasks=[
+            TaskSpec(
+                task_id="task_1",
+                tool_name="submit_ticket",
+                description="Submit Jira task",
+                inputs={
+                    "payload": {
+                        "ticket": {"task_id": "JIRA-123", "title": "Fix bug"},
+                    }
+                },
+            )
+        ],
+    )
+
+    dag = compiler.compile(plan)
+    assert dag.levels == (("task_1",),)
+
 

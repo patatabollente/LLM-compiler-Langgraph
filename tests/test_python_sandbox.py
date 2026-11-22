@@ -1,6 +1,6 @@
 import pytest
 
-from langgraph_llm_compiler.tools import (
+from llm_compiler.tools import (
     PythonCodeInput,
     PythonCodeOutput,
     SandboxSecurityError,

@@ -6,13 +6,13 @@ import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import BaseModel
 
-from langgraph_llm_compiler.compiler import ToolRegistry, ToolSpec
-from langgraph_llm_compiler.react import (
+from langgraph_adapters.react_graph import (
     ReActError,
     ReActMetrics,
     build_react_graph,
     registry_to_langchain_tools,
 )
+from llm_compiler.compiler import ToolRegistry, ToolSpec
 
 
 class FakeToolBoundRunnable:

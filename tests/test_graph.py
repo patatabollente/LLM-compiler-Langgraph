@@ -4,15 +4,15 @@ from typing import Any, Literal
 import pytest
 from pydantic import BaseModel
 
-from langgraph_llm_compiler.compiler import PlanCompiler, ToolRegistry, ToolSpec
-from langgraph_llm_compiler.executor import Executor
-from langgraph_llm_compiler.graph import (
+from langgraph_adapters.compiler_graph import (
     WorkflowError,
     WorkflowMetrics,
     build_compiler_graph,
 )
-from langgraph_llm_compiler.joiner import Joiner, JoinerDecisionOutput, JoinerOutput
-from langgraph_llm_compiler.planner import (
+from llm_compiler.compiler import PlanCompiler, ToolRegistry, ToolSpec
+from llm_compiler.executor import Executor
+from llm_compiler.joiner import Joiner, JoinerDecisionOutput, JoinerOutput
+from llm_compiler.planner import (
     ExecutionPlan,
     InputBinding,
     Planner,
@@ -1111,5 +1111,110 @@ def test_graph_v3_finishes_on_round_1_without_replan_overhead():
     assert final_state["metrics"].replan_attempts == 0
     assert final_state["metrics"].llm_calls == 2
     assert len(joiner_llm.runnables[JoinerOutput].received_messages) == 0
+
+
+def test_graph_direct_response_bypasses_compiler_and_executor_for_empty_plan():
+    """When Planner returns tasks=[], the graph routes directly to Joiner.join_direct()."""
+    registry = _build_registry()
+    empty_plan = ExecutionPlan(
+        objective="Conversational greeting — no tool calls required.",
+        tasks=[],
+    )
+    planner_llm = FakeChatModel(
+        {"parsed": empty_plan, "parsing_error": None, "raw": "{}"}
+    )
+    joiner_llm = SchemaDispatchChatModel(
+        {
+            JoinerDecisionOutput: [],
+            JoinerOutput: [
+                {
+                    "parsed": JoinerOutput(answer="Ciao! Tutto bene, grazie!"),
+                    "parsing_error": None,
+                    "raw": "{direct}",
+                }
+            ],
+        }
+    )
+
+    graph = build_compiler_graph(
+        registry=registry,
+        planner=Planner(llm=planner_llm),  # type: ignore[arg-type]
+        compiler=PlanCompiler(registry=registry),
+        executor=Executor(registry=registry),
+        joiner=Joiner(llm=joiner_llm),  # type: ignore[arg-type]
+        max_compile_retries=2,
+        max_replans=2,
+    )
+
+    final_state = asyncio.run(graph.ainvoke({"request": "come va?"}))
+
+    assert final_state["status"] == "complete"
+    assert final_state["error"] is None
+    assert final_state["final_answer"] == "Ciao! Tutto bene, grazie!"
+    assert final_state.get("compiled_dag") is None
+    assert final_state.get("execution_result") is None
+    metrics = final_state["metrics"]
+    assert metrics.llm_calls == 2  # 1 planner + 1 joiner
+    assert metrics.compile_attempts == 0
+    assert metrics.replan_attempts == 0
+    assert metrics.compilation_latency_ms is None
+    assert metrics.execution_latency_ms is None
+
+
+def test_graph_v3_empty_replan_finalizes_from_prior_rounds():
+    """If Planner returns tasks=[] on a replan round, Joiner synthesizes from prior history."""
+    registry = _build_registry_with_backup()
+    planner_llm = SequenceChatModel(
+        [
+            {"parsed": _valid_plan(), "parsing_error": None, "raw": "{r1}"},
+            {
+                "parsed": ExecutionPlan(objective="No further tools needed.", tasks=[]),
+                "parsing_error": None,
+                "raw": "{r2_empty}",
+            },
+        ]
+    )
+    joiner_llm = SchemaDispatchChatModel(
+        {
+            JoinerDecisionOutput: [
+                {
+                    "parsed": JoinerDecisionOutput(
+                        action="replan",
+                        replan_reason="Check if any backup is needed.",
+                    ),
+                    "parsing_error": None,
+                    "raw": "{replan}",
+                }
+            ],
+            JoinerOutput: [
+                {
+                    "parsed": JoinerOutput(
+                        answer="Dati parziali dal Round 1: Francia = 68.400.000."
+                    ),
+                    "parsing_error": None,
+                    "raw": "{finish}",
+                }
+            ],
+        }
+    )
+
+    graph = build_compiler_graph(
+        registry=registry,
+        planner=Planner(llm=planner_llm),  # type: ignore[arg-type]
+        compiler=PlanCompiler(registry=registry),
+        executor=Executor(registry=registry),
+        joiner=Joiner(llm=joiner_llm),  # type: ignore[arg-type]
+        max_compile_retries=1,
+        max_replans=2,
+    )
+
+    final_state = asyncio.run(graph.ainvoke({"request": "Italia meno Francia"}))
+
+    assert final_state["status"] == "partial"
+    assert final_state["error"] is None
+    assert final_state["final_answer"] == "Dati parziali dal Round 1: Francia = 68.400.000."
+    assert final_state["metrics"].replan_attempts == 1
+    assert final_state["metrics"].llm_calls == 4
+
 
 

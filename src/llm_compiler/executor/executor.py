@@ -7,9 +7,9 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from langgraph_llm_compiler.compiler.dag import CompiledDAG
-from langgraph_llm_compiler.compiler.registry import ToolRegistry
-from langgraph_llm_compiler.planner.schemas import TaskSpec
+from llm_compiler.compiler.dag import CompiledDAG
+from llm_compiler.compiler.registry import ToolRegistry
+from llm_compiler.planner.schemas import TaskSpec
 
 from .bindings import BindingResolutionError, resolve_task_inputs
 from .results import ErrorStage, ExecutionResult, TaskExecutionResult

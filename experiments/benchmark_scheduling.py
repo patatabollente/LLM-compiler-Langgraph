@@ -11,19 +11,19 @@ from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from langgraph_llm_compiler.compiler import (
+from llm_compiler.compiler import (
     CompiledDAG,
     PlanCompiler,
     ToolRegistry,
     ToolSpec,
 )
-from langgraph_llm_compiler.executor import (
+from llm_compiler.executor import (
     ExecutionResult,
     Executor,
     TaskExecutionResult,
     resolve_task_inputs,
 )
-from langgraph_llm_compiler.planner import ExecutionPlan, InputBinding, TaskSpec
+from llm_compiler.planner import ExecutionPlan, InputBinding, TaskSpec
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 MAX_COL = 86

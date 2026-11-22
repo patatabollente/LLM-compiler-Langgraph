@@ -3,7 +3,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from langgraph_llm_compiler.planner.schemas import TaskSpec
+from llm_compiler.planner.schemas import TaskSpec
 
 
 @dataclass(frozen=True, slots=True)

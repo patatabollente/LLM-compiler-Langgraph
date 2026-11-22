@@ -6,7 +6,7 @@ from typing import Any
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel
 
-from langgraph_llm_compiler.compiler.registry import ToolRegistry, ToolSpec
+from llm_compiler.compiler.registry import ToolRegistry, ToolSpec
 
 
 def _serialize_tool_output(value: Any) -> str:

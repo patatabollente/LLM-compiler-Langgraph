@@ -2,10 +2,10 @@ from typing import Any, Literal, NotRequired, Required, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from langgraph_llm_compiler.compiler.dag import CompiledDAG
-from langgraph_llm_compiler.executor.results import ExecutionResult
-from langgraph_llm_compiler.joiner.schemas import ExecutionRound, JoinerResult
-from langgraph_llm_compiler.planner.schemas import ExecutionPlan
+from llm_compiler.compiler.dag import CompiledDAG
+from llm_compiler.executor.results import ExecutionResult
+from llm_compiler.joiner.schemas import ExecutionRound, JoinerResult
+from llm_compiler.planner.schemas import ExecutionPlan
 
 WorkflowStage = Literal["planner", "compiler", "executor", "joiner"]
 WorkflowStatus = Literal["complete", "partial", "failed"]

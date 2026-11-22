@@ -4,8 +4,8 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from langgraph_llm_compiler.executor import ExecutionResult, TaskExecutionResult
-from langgraph_llm_compiler.joiner import (
+from llm_compiler.executor import ExecutionResult, TaskExecutionResult
+from llm_compiler.joiner import (
     REPLAN_SYSTEM_PROMPT,
     ExecutionRound,
     Joiner,
@@ -17,7 +17,7 @@ from langgraph_llm_compiler.joiner import (
     extract_missing_information,
     format_replan_context,
 )
-from langgraph_llm_compiler.planner import ExecutionPlan, InputBinding, TaskSpec
+from llm_compiler.planner import ExecutionPlan, InputBinding, TaskSpec
 
 
 class FakeStructuredRunnable:
@@ -541,4 +541,35 @@ def test_format_replan_context_includes_succeeded_and_failed_details():
     assert "ROUND 1:" in ctx
     assert "68400000" in ctx
     assert "Upstream service unavailable" in ctx
+
+
+def test_join_direct_synthesizes_answer_without_tool_execution():
+    llm = FakeChatModel(
+        {
+            "parsed": JoinerOutput(answer="Ciao! Tutto bene, come posso aiutarti?"),
+            "parsing_error": None,
+            "raw": '{"answer": "Ciao! Tutto bene, come posso aiutarti?"}',
+        }
+    )
+    joiner = Joiner(llm=llm)  # type: ignore[arg-type]
+    empty_plan = ExecutionPlan(objective="Respond to greeting.", tasks=[])
+
+    result = asyncio.run(
+        joiner.join_direct(
+            request="come va?",
+            plan=empty_plan,
+            tool_catalog={"population_lookup": "Get country population"},
+        )
+    )
+
+    assert result.action == "finish"
+    assert result.status == "complete"
+    assert result.answer == "Ciao! Tutto bene, come posso aiutarti?"
+    assert result.missing_information == []
+    assert llm.runnable.call_count == 1
+    human_prompt = llm.runnable.received_messages[1].content
+    assert "come va?" in human_prompt
+    assert "Respond to greeting." in human_prompt
+    assert "population_lookup" in human_prompt
+
 

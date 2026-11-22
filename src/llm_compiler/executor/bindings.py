@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from langgraph_llm_compiler.planner.schemas import InputBinding, TaskSpec
+from llm_compiler.planner.schemas import InputBinding, TaskSpec
 
 from .results import TaskExecutionResult
 

@@ -5,8 +5,8 @@ from typing import Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from langgraph_llm_compiler.executor.results import ExecutionResult
-from langgraph_llm_compiler.planner.schemas import ExecutionPlan, TaskSpec
+from llm_compiler.executor.results import ExecutionResult
+from llm_compiler.planner.schemas import ExecutionPlan, TaskSpec
 
 from .schemas import (
     ExecutionRound,
@@ -45,7 +45,7 @@ Follow these decision rules strictly:
    (b) Earlier tasks succeeded in discovering intermediate data (such as an entity name, identifier, or target value) that is required to run follow-up tool calls still needed to fulfill the ORIGINAL USER REQUEST.
 2. Choose "finish" immediately when:
    (a) All parts of the ORIGINAL USER REQUEST are already satisfied by the successful task outputs across the executed rounds, OR
-   (b) A runtime error is unrecoverable — for example, the error states that a requested entity does not exist or has no alternative tool/dataset, and no other tool in AVAILABLE TOOLS can supply that exact same kind of source data. NEVER waste a replan on unrecoverable errors, and NEVER replan using unrelated tools (such as math or percentage tools) to substitute for missing source data.
+   (b) A runtime error is unrecoverable — for example, the error states that a requested entity does not exist or has no alternative tool/dataset, OR the error indicates a security/sandbox restriction, forbidden operation, or unsupported capability that no tool in AVAILABLE TOOLS can fulfill. NEVER waste a replan on unrecoverable errors, NEVER replan using unrelated tools (such as math or percentage tools) to substitute for missing source data, and NEVER assume or invent tools, libraries, or pre-loaded capabilities that are not explicitly listed in AVAILABLE TOOLS or the error message.
 3. When choosing "replan", write a concise, concrete "replan_reason" stating:
    - what is still needed to fulfill the request,
    - which fallback tool or follow-up tool call(s) to use (and which failing call NOT to repeat),
@@ -57,6 +57,21 @@ Follow these decision rules strictly:
    - Write a natural, user-friendly response without exposing internal identifiers (task_1, output_path, CompiledDAG, etc.).
 
 Return only the structured decision object.
+""".strip()
+
+DIRECT_SYSTEM_PROMPT = """
+You are the Joiner component in an LLM Compiler architecture.
+
+The Planner determined that no external tool calls are needed for the user's request (for example, it is a greeting, a general conversational message, or a request outside the available tools).
+
+Follow these rules strictly:
+
+1. Language: Always respond in the exact same language as the ORIGINAL USER REQUEST.
+2. Natural & helpful: Reply directly, concisely, and naturally to the user.
+3. No fabrication: Never invent data from databases, APIs, or tools that were not called. If the user asked for something that requires tools not available in the catalog, transparently explain what you cannot do and briefly mention what you can help with.
+4. User-friendly: Do not expose internal identifiers or architectural details such as ExecutionPlan, task_1, input_bindings, output_path, or CompiledDAG.
+
+Return only the structured answer.
 """.strip()
 
 
@@ -414,4 +429,53 @@ class Joiner:
             replan_reason=None,
             status=status,
             missing_information=missing_information,
+        )
+
+    @staticmethod
+    def _build_direct_messages(
+        request: str,
+        plan: ExecutionPlan | None = None,
+        *,
+        tool_catalog: Mapping[str, str] | None = None,
+    ) -> list[SystemMessage | HumanMessage]:
+        normalized_request = request.strip()
+        if not normalized_request:
+            raise ValueError("The original user request cannot be empty.")
+
+        sections = [f"ORIGINAL USER REQUEST:\n{normalized_request}"]
+        if plan is not None and plan.objective:
+            sections.append(f"PLANNER NOTE:\n{plan.objective}")
+        if tool_catalog:
+            catalog_lines = "\n".join(
+                f"- {name.strip()}: {desc.strip()}"
+                for name, desc in tool_catalog.items()
+            )
+            sections.append(f"AVAILABLE TOOLS (NONE EXECUTED):\n{catalog_lines}")
+
+        return [
+            SystemMessage(content=DIRECT_SYSTEM_PROMPT),
+            HumanMessage(content="\n\n".join(sections)),
+        ]
+
+    async def join_direct(
+        self,
+        request: str,
+        plan: ExecutionPlan | None = None,
+        *,
+        tool_catalog: Mapping[str, str] | None = None,
+    ) -> JoinerResult:
+        """Synthesize a direct answer when the Planner produced a 0-task plan."""
+        messages = self._build_direct_messages(
+            request=request,
+            plan=plan,
+            tool_catalog=tool_catalog,
+        )
+        response = await self._structured_llm.ainvoke(messages)
+        output = self._extract_output(response)
+        return JoinerResult(
+            action="finish",
+            answer=output.answer,
+            replan_reason=None,
+            status="complete",
+            missing_information=[],
         )

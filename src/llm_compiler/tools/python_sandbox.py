@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from langgraph_llm_compiler.compiler.registry import ToolSpec
+from llm_compiler.compiler.registry import ToolSpec
 
 _FORBIDDEN_CALLS = frozenset(
     {

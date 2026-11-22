@@ -39,12 +39,12 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
 
-from langgraph_llm_compiler.compiler import PlanCompiler, ToolRegistry, ToolSpec
-from langgraph_llm_compiler.executor import Executor
-from langgraph_llm_compiler.graph import build_compiler_graph
-from langgraph_llm_compiler.joiner import Joiner
-from langgraph_llm_compiler.llm import create_ollama_chat_model
-from langgraph_llm_compiler.planner import Planner
+from langgraph_adapters.compiler_graph import build_compiler_graph
+from llm_compiler.compiler import PlanCompiler, ToolRegistry, ToolSpec
+from llm_compiler.executor import Executor
+from llm_compiler.joiner import Joiner
+from llm_compiler.llm import create_ollama_chat_model
+from llm_compiler.planner import Planner
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 

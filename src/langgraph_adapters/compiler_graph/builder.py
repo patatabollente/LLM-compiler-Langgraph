@@ -4,19 +4,18 @@ from typing import Any, Literal
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from langgraph_llm_compiler.compiler.compiler import PlanCompiler
-from langgraph_llm_compiler.compiler.registry import ToolRegistry
-from langgraph_llm_compiler.executor.executor import Executor
-from langgraph_llm_compiler.joiner.joiner import Joiner
-from langgraph_llm_compiler.planner.planner import Planner
-
-from .nodes import (
-    make_compiler_node,
-    make_executor_node,
-    make_joiner_node,
-    make_planner_node,
+from llm_compiler.compiler.compiler import PlanCompiler
+from llm_compiler.compiler.registry import ToolRegistry
+from llm_compiler.executor.executor import Executor
+from llm_compiler.joiner.joiner import Joiner
+from llm_compiler.planner.planner import Planner
+from llm_compiler.state import CompilerState
+from llm_compiler.steps import (
+    make_compiler_step,
+    make_executor_step,
+    make_joiner_step,
+    make_planner_step,
 )
-from .state import CompilerState
 
 
 def _make_planner_router(
@@ -26,6 +25,9 @@ def _make_planner_router(
         state: CompilerState,
     ) -> Literal["compiler", "joiner", "__end__"]:
         if state.get("error") is None:
+            plan = state.get("plan")
+            if plan is not None and len(plan.tasks) == 0:
+                return "joiner"
             return "compiler"
         if max_replans > 0 and state.get("execution_history"):
             return "joiner"
@@ -123,19 +125,21 @@ def build_compiler_graph(
     builder: StateGraph[CompilerState, Any, CompilerState, CompilerState] = StateGraph(
         CompilerState
     )
-    builder.add_node("planner", make_planner_node(planner, catalog))
-    builder.add_node("compiler", make_compiler_node(compiler))
-    builder.add_node("executor", make_executor_node(executor))
+    builder.add_node("planner", make_planner_step(planner, catalog))
+    builder.add_node("compiler", make_compiler_step(compiler))
+    builder.add_node("executor", make_executor_step(executor))
     builder.add_node(
         "joiner",
-        make_joiner_node(joiner, catalog=catalog, max_replans=max_replans),
+        make_joiner_step(joiner, catalog=catalog, max_replans=max_replans),
     )
 
     builder.add_edge(START, "planner")
 
-    planner_targets: dict[str, str] = {"compiler": "compiler", END: END}
-    if max_replans > 0:
-        planner_targets["joiner"] = "joiner"
+    planner_targets: dict[str, str] = {
+        "compiler": "compiler",
+        "joiner": "joiner",
+        END: END,
+    }
     builder.add_conditional_edges(
         "planner",
         _make_planner_router(max_replans),

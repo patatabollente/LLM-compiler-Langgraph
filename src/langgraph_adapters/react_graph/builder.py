@@ -14,8 +14,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
-from langgraph_llm_compiler.compiler.registry import ToolRegistry
-from langgraph_llm_compiler.graph.state import WorkflowStatus
+from llm_compiler.compiler.registry import ToolRegistry
+from llm_compiler.state import WorkflowStatus
 
 from .state import ReActError, ReActMetrics, ReActState, update_react_metrics
 from .tools import registry_to_langchain_tools

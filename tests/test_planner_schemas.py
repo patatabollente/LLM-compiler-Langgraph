@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from langgraph_llm_compiler.planner.schemas import (
+from llm_compiler.planner.schemas import (
     ExecutionPlan,
     InputBinding,
     TaskSpec,
@@ -140,9 +140,12 @@ def test_forbids_extra_and_legacy_fields():
         )
 
 
-def test_requires_at_least_one_task():
-    with pytest.raises(ValidationError):
-        ExecutionPlan(objective="Empty plan", tasks=[])
+def test_allows_empty_plan_for_direct_responses():
+    plan = ExecutionPlan(objective="Greeting — no tools needed", tasks=[])
+    assert plan.tasks == []
+
+    default_plan = ExecutionPlan(objective="Conversational reply")
+    assert default_plan.tasks == []
 
 
 def test_models_are_frozen():

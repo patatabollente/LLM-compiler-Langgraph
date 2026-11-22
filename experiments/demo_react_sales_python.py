@@ -18,8 +18,8 @@ from typing import Any
 from demo_python_code_v3 import QUERIES, build_registry
 from langchain_core.messages import AIMessage, ToolMessage
 
-from langgraph_llm_compiler.llm import create_ollama_chat_model
-from langgraph_llm_compiler.react import build_react_graph
+from langgraph_adapters.react_graph import build_react_graph
+from llm_compiler.llm import create_ollama_chat_model
 
 
 def _print_tool_call(tc: dict[str, Any]) -> None:

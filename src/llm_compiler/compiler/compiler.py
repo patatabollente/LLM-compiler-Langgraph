@@ -1,10 +1,11 @@
+import json
 from collections.abc import Mapping
 from types import UnionType
 from typing import Annotated, Any, Union, get_args, get_origin
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from langgraph_llm_compiler.planner.schemas import ExecutionPlan, InputBinding, TaskSpec
+from llm_compiler.planner.schemas import ExecutionPlan, InputBinding, TaskSpec
 
 from .dag import CompilationIssue, CompiledDAG, PlanCompilationError
 from .registry import ToolRegistry, ToolSpec
@@ -83,7 +84,9 @@ class PlanCompiler:
                     )
                 )
 
-            malformed_params = self._validate_malformed_bindings(task, issues)
+            malformed_params = self._validate_malformed_bindings(
+                task, tasks_by_id, issues
+            )
             self._validate_bindings(task, tasks_by_id, issues)
 
             if tool_spec is not None:
@@ -127,33 +130,119 @@ class PlanCompiler:
         )
 
     @staticmethod
+    def _looks_like_nested_binding(
+        value: Any,
+        tasks_by_id: Mapping[str, TaskSpec],
+    ) -> bool:
+        if isinstance(value, InputBinding):
+            return True
+        if not isinstance(value, Mapping) or "task_id" not in value:
+            return False
+        if "output_path" in value:
+            return True
+        raw_task_id = value.get("task_id")
+        return isinstance(raw_task_id, str) and raw_task_id.strip() in tasks_by_id
+
+    @classmethod
+    def _find_nested_bindings(
+        cls,
+        value: Any,
+        tasks_by_id: Mapping[str, TaskSpec],
+        *,
+        prefix: str = "",
+    ) -> list[tuple[str, Any]]:
+        """Recursively locate InputBinding-like objects nested inside static containers."""
+        found: list[tuple[str, Any]] = []
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                child_path = f"{prefix}.{key}" if prefix else str(key)
+                if cls._looks_like_nested_binding(item, tasks_by_id):
+                    found.append((child_path, item))
+                else:
+                    found.extend(
+                        cls._find_nested_bindings(
+                            item, tasks_by_id, prefix=child_path
+                        )
+                    )
+        elif isinstance(value, (list, tuple)):
+            for idx, item in enumerate(value):
+                child_path = f"{prefix}[{idx}]"
+                if cls._looks_like_nested_binding(item, tasks_by_id):
+                    found.append((child_path, item))
+                else:
+                    found.extend(
+                        cls._find_nested_bindings(
+                            item, tasks_by_id, prefix=child_path
+                        )
+                    )
+        return found
+
+    @classmethod
     def _validate_malformed_bindings(
+        cls,
         task: TaskSpec,
+        tasks_by_id: Mapping[str, TaskSpec],
         issues: list[CompilationIssue],
     ) -> set[str]:
         malformed: set[str] = set()
         for param_name, value in task.static_inputs.items():
-            if not (isinstance(value, Mapping) and "task_id" in value):
+            if isinstance(value, Mapping) and "task_id" in value:
+                try:
+                    InputBinding.model_validate(value)
+                except ValidationError as exc:
+                    malformed.add(param_name)
+                    details = "; ".join(
+                        f"{'.'.join(str(p) for p in err['loc']) or 'binding'}: {err['msg']}"
+                        for err in exc.errors()
+                    )
+                    issues.append(
+                        CompilationIssue(
+                            code="malformed_binding",
+                            task_id=task.task_id,
+                            field=param_name,
+                            message=(
+                                f"Parameter '{param_name}' looks like a malformed "
+                                "InputBinding (allowed keys: 'task_id', 'output_path'): "
+                                f"{details}."
+                            ),
+                        )
+                    )
                 continue
 
-            try:
-                InputBinding.model_validate(value)
-            except ValidationError as exc:
+            nested_bindings = cls._find_nested_bindings(value, tasks_by_id)
+            if nested_bindings:
                 malformed.add(param_name)
-                details = "; ".join(
-                    f"{'.'.join(str(p) for p in err['loc']) or 'binding'}: {err['msg']}"
-                    for err in exc.errors()
-                )
+                if len(nested_bindings) == 1:
+                    path, nested_obj = nested_bindings[0]
+                    raw_obj = (
+                        nested_obj.model_dump()
+                        if isinstance(nested_obj, InputBinding)
+                        else dict(nested_obj)
+                    )
+                    try:
+                        concrete_binding = json.dumps(raw_obj, ensure_ascii=False)
+                    except TypeError:
+                        concrete_binding = repr(raw_obj)
+                    message = (
+                        f"Parameter '{param_name}' wraps an InputBinding inside "
+                        f"'{path}'. InputBinding objects cannot be nested inside "
+                        f"dicts or lists; set '{param_name}' directly to "
+                        f"{concrete_binding} instead of wrapping it under '{path}'."
+                    )
+                else:
+                    locations = ", ".join(f"'{p}'" for p, _ in nested_bindings)
+                    message = (
+                        f"Parameter '{param_name}' contains nested InputBinding "
+                        f"objects at {locations}. InputBinding objects cannot be "
+                        "nested inside dicts or lists; bind each upstream output "
+                        "directly to a top-level tool parameter."
+                    )
                 issues.append(
                     CompilationIssue(
-                        code="malformed_binding",
+                        code="nested_binding",
                         task_id=task.task_id,
                         field=param_name,
-                        message=(
-                            f"Parameter '{param_name}' looks like a malformed "
-                            "InputBinding (allowed keys: 'task_id', 'output_path'): "
-                            f"{details}."
-                        ),
+                        message=message,
                     )
                 )
         return malformed
