@@ -3,13 +3,19 @@ import json
 from typing import Any, Literal
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from pydantic import BaseModel
 
 from langgraph_adapters.react_graph import (
+    InferenceParams,
+    OpenAICompatibleConfig,
+    ParallelReactLangGraphRunner,
+    ParallelRunResult,
     ReActError,
     ReActMetrics,
+    ToolBinding,
     build_react_graph,
+    normalize_to_registry,
     registry_to_langchain_tools,
 )
 from llm_compiler.compiler import ToolRegistry, ToolSpec
@@ -24,6 +30,23 @@ class FakeToolBoundRunnable:
         self.received_messages.append(list(messages))
         idx = min(len(self.received_messages) - 1, len(self._responses) - 1)
         return self._responses[idx]
+
+    async def astream(self, messages: list[Any]):
+        self.received_messages.append(list(messages))
+        idx = min(len(self.received_messages) - 1, len(self._responses) - 1)
+        resp = self._responses[idx]
+        if resp.tool_calls:
+            yield resp
+            return
+        text = str(resp.content)
+        mid = max(1, len(text) // 2)
+        yield AIMessageChunk(content=text[:mid])
+        await asyncio.sleep(0.01)
+        yield AIMessageChunk(
+            content=text[mid:],
+            usage_metadata=resp.usage_metadata,
+            response_metadata=resp.response_metadata,
+        )
 
 
 class FakeReActChatModel:
@@ -313,3 +336,238 @@ def test_react_graph_streaming_order_and_mermaid():
     mermaid = graph.get_graph().draw_mermaid()
     assert "agent -.-> tools" in mermaid
     assert "tools -.-> agent" in mermaid
+
+
+def test_parallel_react_runner_captures_waves_speedup_ttft_and_cached_tokens():
+    async def slow_lookup(key: str) -> dict[str, Any]:
+        await asyncio.sleep(0.06)
+        return {"key": key, "val": 10 if key == "x" else 20}
+
+    fake_llm = FakeReActChatModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "t1", "name": "slow_lookup", "args": {"key": "x"}},
+                    {"id": "t2", "name": "slow_lookup", "args": {"key": "y"}},
+                ],
+                usage_metadata={
+                    "input_tokens": 100,
+                    "output_tokens": 40,
+                    "total_tokens": 140,
+                    "input_token_details": {"cache_read": 30},
+                },
+            ),
+            AIMessage(
+                content="Risultato combinato: 30.",
+                usage_metadata={
+                    "input_tokens": 180,
+                    "output_tokens": 25,
+                    "total_tokens": 205,
+                    "input_token_details": {"cache_read": 90},
+                },
+            ),
+        ]
+    )
+
+    runner = ParallelReactLangGraphRunner(
+        tools=[slow_lookup],  # plain Python callable!
+        llm=fake_llm,  # type: ignore[arg-type]
+        max_turns=5,
+        allow_parallel_tool_calls=True,
+    )
+    res = runner.run_sync("Somma x e y")
+
+    assert isinstance(res, ParallelRunResult)
+    assert res.status == "completed"
+    assert res.workflow_status == "complete"
+    assert res.termination_reason == "completed"
+    assert res.timed_out is False
+    assert res.answer == "Risultato combinato: 30."
+    assert res.llm_round_trips == 2
+    assert res.tool_call_count == 2
+    assert res.time_to_first_token_ms is not None and res.time_to_first_token_ms >= 0.0
+
+    # Token usage + cached prompt tokens breakdown
+    assert res.tokens.source == "provider"
+    assert res.tokens.input_tokens == 280
+    assert res.tokens.output_tokens == 65
+    assert res.tokens.total_tokens == 345
+    assert res.tokens.cached_input_tokens == 120
+
+    # Per-turn telemetry
+    assert len(res.turns) == 2
+    assert res.turns[0].tool_call_ids == ["t1", "t2"]
+    assert res.turns[0].cached_input_tokens == 30
+    assert res.turns[1].cached_input_tokens == 90
+
+    # Per-wave parallel speedup telemetry (2 x 60ms in parallel -> wall ~60ms, speedup > 1.4)
+    assert len(res.waves) == 1
+    wave = res.waves[0]
+    assert wave.tool_call_count == 2
+    assert wave.tool_names == ["slow_lookup", "slow_lookup"]
+    assert wave.speedup is not None and wave.speedup > 1.4
+    assert wave.parallel_efficiency is not None and 0.7 < wave.parallel_efficiency <= 1.0
+    assert res.overhead_ms >= 0.0
+
+
+def test_parallel_react_runner_sequential_mode_disables_parallel_wave_overlap():
+    async def delayed(tag: str) -> str:
+        await asyncio.sleep(0.05)
+        return f"done:{tag}"
+
+    fake_llm = FakeReActChatModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "s1", "name": "delayed", "args": {"tag": "a"}},
+                    {"id": "s2", "name": "delayed", "args": {"tag": "b"}},
+                ],
+            ),
+            AIMessage(content="Fatto in sequenza."),
+        ]
+    )
+
+    runner = ParallelReactLangGraphRunner(
+        tools=[delayed],
+        llm=fake_llm,  # type: ignore[arg-type]
+        allow_parallel_tool_calls=False,
+    )
+    res = runner.run_sync("Esegui a e b")
+
+    assert res.status == "completed"
+    assert len(res.waves) == 1
+    # Executed sequentially -> wall_ms >= ~100ms, speedup close to 1.0
+    assert res.waves[0].wall_ms >= 90.0
+    assert res.waves[0].speedup is not None and res.waves[0].speedup <= 1.15
+
+
+def test_parallel_react_runner_supports_tool_binding_json_schema_and_dict_tools():
+    def custom_add(a: int, b: int = 1) -> int:
+        return a + b
+
+    binding = ToolBinding(
+        function=custom_add,
+        name="add_nums",
+        description="Add two integers.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer", "description": "First integer"},
+                "b": {"type": "integer", "default": 1},
+            },
+            "required": ["a"],
+            "additionalProperties": False,
+        },
+    )
+    dict_tool = {
+        "name": "echo_msg",
+        "description": "Echo text back.",
+        "func": lambda text: f"echo:{text}",
+        "parameters": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    }
+
+    reg = normalize_to_registry([binding, dict_tool])
+    assert set(reg) == {"add_nums", "echo_msg"}
+
+    fake_llm = FakeReActChatModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "b1", "name": "add_nums", "args": {"a": 5, "b": 7}},
+                    {"id": "b2", "name": "echo_msg", "args": {"text": "ciao"}},
+                ],
+            ),
+            AIMessage(content="12 e echo:ciao"),
+        ]
+    )
+    runner = ParallelReactLangGraphRunner(
+        tools=[binding, dict_tool],
+        llm=fake_llm,  # type: ignore[arg-type]
+    )
+    res = runner.run_sync("Somma 5+7 ed echo ciao")
+    assert res.status == "completed"
+    assert [tc.result for tc in res.tool_calls] == ["12", "echo:ciao"]
+
+
+def test_parallel_react_runner_handles_run_timeout_and_max_turns_exceeded():
+    async def hang(x: str) -> str:
+        await asyncio.sleep(1.0)
+        return x
+
+    fake_timeout_llm = FakeReActChatModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[{"id": "h1", "name": "hang", "args": {"x": "go"}}],
+            ),
+            AIMessage(content="never"),
+        ]
+    )
+    timeout_runner = ParallelReactLangGraphRunner(
+        tools=[hang],
+        llm=fake_timeout_llm,  # type: ignore[arg-type]
+        timeout_seconds=0.05,
+    )
+    res_timeout = timeout_runner.run_sync("Aspetta")
+    assert res_timeout.status == "error"
+    assert res_timeout.timed_out is True
+    assert res_timeout.termination_reason == "timeout"
+
+    fake_loop_llm = FakeReActChatModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[{"id": "l1", "name": "fetch_item", "args": {"item": "A"}}],
+            )
+        ]
+    )
+    loop_runner = ParallelReactLangGraphRunner(
+        tools=_build_registry(),
+        llm=fake_loop_llm,  # type: ignore[arg-type]
+        max_turns=2,
+    )
+    res_loop = loop_runner.run_sync("Loop")
+    assert res_loop.status == "max_turns_exceeded"
+    assert res_loop.termination_reason == "request_limit"
+    assert res_loop.workflow_status == "failed"
+
+
+def test_openai_compatible_config_and_runner_validation():
+    cfg = OpenAICompatibleConfig(
+        model="qwen3:8b",
+        base_url="http://localhost:11434/v1",
+        provider="ollama",
+    )
+    params = InferenceParams(temperature=0.0, max_tokens=512, reasoning=False)
+    runner = ParallelReactLangGraphRunner(
+        tools=[],
+        model_config=cfg,
+        inference_params=params,
+    )
+    assert runner.model_config is not None
+    assert runner.model_config.model == "qwen3:8b"
+    assert runner.inference_params.max_tokens == 512
+
+    with pytest.raises(ValueError, match="llm=.*model_config="):
+        ParallelReactLangGraphRunner(tools=[])
+
+    with pytest.raises(ValueError, match="max_turns"):
+        ParallelReactLangGraphRunner(
+            tools=[],
+            model_config=cfg,
+            max_turns=0,
+        )
+
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        ParallelReactLangGraphRunner(
+            tools=[],
+            model_config=cfg,
+            timeout_seconds=-1.0,
+        )
